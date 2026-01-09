@@ -108,6 +108,139 @@ def capitalize_hotkey_str(s):
     return HotkeyUtils.format_hotkey_display(s)
 
 
+# =================================================================
+# 迷你状态栏窗口类
+# =================================================================
+class MiniStatusWindow:
+    """
+    宏执行时的迷你悬浮状态栏窗口
+    
+    特性：
+    - 无边框、始终置顶
+    - 左下角显示
+    - 尺寸：380x35像素
+    - 点击可停止宏
+    """
+    def __init__(self, parent, stop_callback):
+        """
+        初始化迷你状态栏窗口
+        
+        Args:
+            parent: 父窗口
+            stop_callback: 停止宏的回调函数
+        """
+        self.parent = parent
+        self.stop_callback = stop_callback
+        
+        # 创建顶层窗口
+        self.window = tk.Toplevel(parent)
+        self.window.overrideredirect(True)  # 无边框
+        self.window.attributes('-topmost', True)  # 始终置顶
+        
+        # 固定尺寸（适中宽度，既能显示完整信息又保持美观）
+        window_width = 500
+        window_height = 35
+        
+        # 计算左下角位置
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        x = 10  # 左边距
+        y = screen_height - window_height - 50  # 底部边距
+        
+        self.window.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        
+        # 主框架（使用与状态栏相同的样式）
+        main_frame = ttk.Frame(self.window, bootstyle="primary", padding=0)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 左侧状态文本
+        self.status_label = ttk.Label(
+            main_frame, 
+            text="运行中...", 
+            relief=tk.FLAT, 
+            anchor=tk.W, 
+            padding=(8, 5),
+            bootstyle="primary-inverse",
+            font=("Microsoft YaHei UI", 9)
+        )
+        self.status_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # 右侧循环信息
+        self.loop_label = ttk.Label(
+            main_frame, 
+            text="", 
+            relief=tk.FLAT, 
+            anchor=tk.E, 
+            padding=(0, 5, 8, 5),
+            bootstyle="primary-inverse",
+            font=("Microsoft YaHei UI", 9)
+        )
+        self.loop_label.pack(side=tk.RIGHT)
+        
+        # 绑定点击事件（点击任意位置都可以停止）
+        main_frame.bind("<Button-1>", self._on_click)
+        self.status_label.bind("<Button-1>", self._on_click)
+        self.loop_label.bind("<Button-1>", self._on_click)
+        
+        # 鼠标悬停效果
+        self._bind_hover_effects(main_frame)
+        self._bind_hover_effects(self.status_label)
+        self._bind_hover_effects(self.loop_label)
+        
+        # 存储原始背景色（用于恢复）
+        self._original_bg = None
+    
+    def _bind_hover_effects(self, widget):
+        """绑定鼠标悬停效果"""
+        widget.bind("<Enter>", self._on_enter)
+        widget.bind("<Leave>", self._on_leave)
+    
+    def _on_enter(self, event):
+        """鼠标进入时的效果"""
+        try:
+            # 修改光标为手型
+            self.window.config(cursor="hand2")
+            # 可以添加颜色变化效果（可选）
+        except:
+            pass
+    
+    def _on_leave(self, event):
+        """鼠标离开时的效果"""
+        try:
+            # 恢复默认光标
+            self.window.config(cursor="")
+        except:
+            pass
+    
+    def _on_click(self, event):
+        """点击窗口时停止宏"""
+        if self.stop_callback:
+            self.stop_callback()
+    
+    def update_status(self, status_text, loop_text=""):
+        """
+        更新显示内容
+        
+        Args:
+            status_text: 状态文本
+            loop_text: 循环信息文本
+        """
+        try:
+            if self.window.winfo_exists():
+                self.status_label.config(text=status_text)
+                self.loop_label.config(text=loop_text)
+        except tk.TclError:
+            pass  # 窗口已销毁
+    
+    def destroy(self):
+        """销毁窗口"""
+        try:
+            if self.window.winfo_exists():
+                self.window.destroy()
+        except tk.TclError:
+            pass
+
+
 class MacroApp:
     def __init__(self, root):
         self.root = root
@@ -136,6 +269,9 @@ class MacroApp:
         self.last_test_location = None 
         self.current_run_context = None 
         self.held_keys = set()
+        
+        # [新增] 迷你状态栏窗口
+        self.mini_status_window = None
         
         self.hotkey_run_str = tb.StringVar(value=DEFAULT_HOTKEY_RUN)
         self.hotkey_stop_str = tb.StringVar(value=DEFAULT_HOTKEY_STOP)
@@ -1298,8 +1434,17 @@ class MacroApp:
             
         self.run_btn.config(state="disabled")
         self.status_var.set(f"宏正在运行... [{stop_display}] 停止")
-        if not self.dont_minimize_var.get(): self.root.iconify()
-        else: self.root.attributes('-topmost', True) 
+        
+        # [新增] 创建迷你状态栏窗口（在最小化前）
+        if not self.dont_minimize_var.get():
+            self.mini_status_window = MiniStatusWindow(self.root, self.safe_stop_macro)
+            self.mini_status_window.update_status(
+                f"宏正在运行... [点击停止 或 {stop_display}]",
+                ""
+            )
+            self.root.iconify()
+        else:
+            self.root.attributes('-topmost', True) 
         self.root.after(1500, self._start_macro_thread)
 
     def _start_macro_thread(self):
@@ -1319,6 +1464,12 @@ class MacroApp:
     def _on_macro_complete(self):
         self.is_macro_running = False
         self.current_run_context = None
+        
+        # [新增] 销毁迷你状态栏窗口
+        if self.mini_status_window:
+            self.mini_status_window.destroy()
+            self.mini_status_window = None
+        
         self.root.deiconify()
         self.root.attributes('-topmost', False)
         self.run_btn.config(state="normal")
@@ -1347,7 +1498,18 @@ class MacroApp:
                 text = self.status_queue.get_nowait()
                 count += 1
             
-            if text: self.loop_status_var.set(text)
+            if text:
+                self.loop_status_var.set(text)
+            
+            # [新增] 同步更新迷你窗口（即使没有新状态，也要显示当前状态）
+            if self.mini_status_window:
+                stop_display = capitalize_hotkey_str(self.hotkey_stop_str.get())
+                # 获取当前循环状态（可能为空或有值）
+                current_loop_status = self.loop_status_var.get()
+                self.mini_status_window.update_status(
+                    f"宏正在运行... [点击停止 或 {stop_display}]",
+                    current_loop_status  # 显示当前循环状态
+                )
         except queue.Empty:
             pass
         except Exception as e:
