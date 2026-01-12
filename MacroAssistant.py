@@ -19,6 +19,7 @@ import sys
 import queue
 from PIL import Image, ImageGrab, ImageTk
 import functools
+import webbrowser
 
 # 强制启用 DPI 感知，解决 125%/150% 缩放下的坐标偏移问题
 try:
@@ -47,7 +48,7 @@ except ImportError:
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.56.0"
+APP_VERSION = "1.56.8"
 APP_TITLE = f"宏助手 (Macro Assistant) V{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 CONFIG_FILE = "macro_settings.json"
@@ -69,6 +70,45 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
+
+def get_icon_path():
+    """
+    获取图标路径,打包后从临时目录提取
+    返回可用于 iconbitmap() 的实际文件路径
+    """
+    icon_name = APP_ICON
+    
+    # 开发环境直接返回
+    if not getattr(sys, 'frozen', False):
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), icon_name)
+        if os.path.exists(icon_path):
+            return icon_path
+        return None
+    
+    # 打包环境:提取到临时目录
+    try:
+        import tempfile
+        import shutil
+        
+        # 从 _MEIPASS 获取图标
+        source_icon = os.path.join(sys._MEIPASS, icon_name)
+        
+        if not os.path.exists(source_icon):
+            print(f"[警告] 未找到打包的图标文件: {source_icon}")
+            return None
+        
+        # 创建临时文件
+        temp_dir = tempfile.gettempdir()
+        temp_icon = os.path.join(temp_dir, f"macroassistant_{APP_VERSION}.ico")
+        
+        # 复制图标到临时目录
+        shutil.copy2(source_icon, temp_icon)
+        print(f"[Info] 图标已提取到: {temp_icon}")
+        
+        return temp_icon
+    except Exception as e:
+        print(f"[错误] 提取图标失败: {e}")
+        return None
 
 try:
     import core_engine as macro_engine
@@ -258,10 +298,27 @@ class MacroApp:
         self.is_app_running = True
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
         
-        icon_path = resource_path(APP_ICON) 
-        if os.path.exists(icon_path):
-            try: self.root.iconbitmap(icon_path)
-            except tk.TclError: pass
+        # 设置窗口图标 (确保任务栏显示)
+        icon_path = get_icon_path()
+        if icon_path and os.path.exists(icon_path):
+            try: 
+                self.root.iconbitmap(icon_path)
+                print(f"[Info] 图标已设置: {icon_path}")
+                
+                # Windows 特定：确保任务栏图标正确显示
+                if sys.platform == 'win32':
+                    try:
+                        import ctypes
+                        # 设置应用程序用户模型ID,确保任务栏分组和图标显示正确
+                        myappid = f'hxlive.macroassistant.{APP_VERSION}'
+                        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+                        print(f"[Info] AppUserModelID 已设置: {myappid}")
+                    except Exception as e:
+                        print(f"[警告] 设置 AppUserModelID 失败: {e}")
+            except Exception as e: 
+                print(f"[错误] 设置图标失败: {e}")
+        else:
+            print(f"[警告] 未找到图标文件,使用默认图标")
         
         self.steps = []
         self.editing_index = None
@@ -350,6 +407,10 @@ class MacroApp:
         dark_themes = ['superhero', 'cyborg', 'darkly', 'solar']
         for theme in dark_themes:
             theme_menu.add_radiobutton(label=f"暗 - {theme.capitalize()}", variable=self.current_theme, value=theme, command=self.change_theme)
+
+        about_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
+        self.menu_bar.add_cascade(label="  关于  ", menu=about_menu)
+        about_menu.add_command(label="主页", command=lambda: webbrowser.open("https://github.com/hxlive/MacroAssistant/"))
 
     def _init_ui(self):
         status_bar_frame = ttk.Frame(self.root, bootstyle="primary")
