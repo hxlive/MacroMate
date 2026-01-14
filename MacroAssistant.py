@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 # MacroAssistant.py
 # 描述: 自动化宏的 GUI 界面
-# 版本: 1.56.0
-# 变更: (升级) 列表控件升级为 Treeview (分列显示)。
-#       (新增) 增加悬浮图片预览功能 (鼠标悬停在步骤上自动显示)。
-#       (依赖) 需要 Pillow 库 (PIL) 支持图片显示。
+# 版本: 1.58.0
+# 变更: (新增) 关于窗口和信息。
+#       (修改) 重新设计程序图标。
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -48,7 +47,7 @@ except ImportError:
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.56.8"
+APP_VERSION = "1.58.0"
 APP_TITLE = f"宏助手 (Macro Assistant) V{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 CONFIG_FILE = "macro_settings.json"
@@ -410,7 +409,7 @@ class MacroApp:
 
         about_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
         self.menu_bar.add_cascade(label="  关于  ", menu=about_menu)
-        about_menu.add_command(label="主页", command=lambda: webbrowser.open("https://github.com/hxlive/MacroAssistant/"))
+        about_menu.add_command(label="关于", command=self.show_about_dialog)
 
     def _init_ui(self):
         status_bar_frame = ttk.Frame(self.root, bootstyle="primary")
@@ -633,6 +632,189 @@ class MacroApp:
         
         self.restart_hotkey_listener()
         self.update_status_bar_hotkeys()
+
+    def show_about_dialog(self):
+        """显示关于对话框"""
+        # 防止重复打开关于对话框
+        if hasattr(self, '_about_dialog_ref') and self._about_dialog_ref and self._about_dialog_ref.winfo_exists():
+            self._about_dialog_ref.focus_force()
+            return
+        
+        # 创建关于对话框
+        about_dialog = tk.Toplevel(self.root)
+        self._about_dialog_ref = about_dialog  # 保存引用
+        about_dialog.title("关于")
+        about_dialog.geometry("500x340")  # 足够宽度显示完整链接
+        about_dialog.resizable(False, False)
+        about_dialog.transient(self.root)
+        about_dialog.grab_set()
+        
+        # 获取图标路径（只调用一次）
+        icon_path = get_icon_path()
+        
+        # 设置窗口图标
+        if icon_path and os.path.exists(icon_path):
+            try:
+                about_dialog.iconbitmap(icon_path)
+            except (OSError, tk.TclError) as e:
+                print(f"[警告] 设置关于对话框图标失败: {e}")
+        
+        # 相对于主窗口居中显示
+        about_dialog.update_idletasks()
+        
+        # 获取主窗口的位置和大小
+        main_x = self.root.winfo_x()
+        main_y = self.root.winfo_y()
+        main_width = self.root.winfo_width()
+        main_height = self.root.winfo_height()
+        
+        # 获取关于对话框的大小
+        dialog_width = about_dialog.winfo_width()
+        dialog_height = about_dialog.winfo_height()
+        
+        # 计算居中位置
+        x = main_x + (main_width - dialog_width) // 2
+        y = main_y + (main_height - dialog_height) // 2
+        
+        about_dialog.geometry(f"+{x}+{y}")
+        
+        # 主框架 - 减小内边距
+        main_frame = ttk.Frame(about_dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # ========== 顶部：图标和软件标题区域 ==========
+        # 外层容器 - 将所有内容居中
+        top_outer = ttk.Frame(main_frame)
+        top_outer.pack(fill=tk.X, pady=(5, 18))
+        
+        # 内层容器 - 实际内容区域
+        top_frame = ttk.Frame(top_outer)
+        top_frame.pack(anchor="center")
+        
+        # 左侧：图标
+        icon_container = ttk.Frame(top_frame)
+        icon_container.pack(side=tk.LEFT, padx=(0, 28))
+        
+        # 显示图标（使用已获取的icon_path）
+        if icon_path and os.path.exists(icon_path):
+            try:
+                # 使用上下文管理器加载图标，避免资源泄漏
+                from PIL import Image, ImageTk
+                with Image.open(icon_path) as icon_img:
+                    # 调整大小
+                    resized_img = icon_img.resize((96, 96), Image.Resampling.LANCZOS)
+                    icon_photo = ImageTk.PhotoImage(resized_img)
+                    
+                    icon_label = ttk.Label(icon_container, image=icon_photo)
+                    icon_label.image = icon_photo  # 保持引用防止被垃圾回收
+                    icon_label.pack()
+            except (OSError, IOError) as e:
+                print(f"[警告] 加载图标图像失败: {e}")
+                ttk.Label(icon_container, text="🔧", font=("Microsoft YaHei UI", 48)).pack()
+        else:
+            ttk.Label(icon_container, text="🔧", font=("Microsoft YaHei UI", 48)).pack()
+        
+        # 右侧：软件标题和版本（左对齐）
+        title_container = ttk.Frame(top_frame)
+        title_container.pack(side=tk.LEFT, pady=10)
+        
+        # 软件名称
+        ttk.Label(title_container, 
+                 text="宏助手",
+                 font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w", pady=(0, 2))
+        
+        ttk.Label(title_container, 
+                 text="Macro Assistant",
+                 font=("Microsoft YaHei UI", 10),
+                 foreground="#666666").pack(anchor="w", pady=(0, 6))
+        
+        # 版本信息
+        version_frame = ttk.Frame(title_container)
+        version_frame.pack(anchor="w")
+        
+        version_label = ttk.Label(version_frame, 
+                                 text=f" v{APP_VERSION} ",
+                                 font=("Consolas", 9, "bold"),
+                                 bootstyle="info",
+                                 padding=(6, 2))
+        version_label.pack(side=tk.LEFT)
+
+        
+        # ========== 分隔线 ==========
+        separator1 = ttk.Separator(main_frame, orient='horizontal')
+        separator1.pack(fill='x', pady=(0, 18))
+        
+        # ========== 中部：详细信息区域 ==========
+        info_frame = ttk.Frame(main_frame)
+        info_frame.pack(fill=tk.X, pady=(0, 18), padx=5)
+        
+        # 使用网格布局，更整齐
+        info_frame.columnconfigure(1, weight=1)
+        
+        # 作者信息
+        ttk.Label(info_frame, 
+                 text="软件作者",
+                 font=("Microsoft YaHei UI", 10, "bold"),
+                 foreground="#777777").grid(row=0, column=0, sticky="w", padx=(0, 20), pady=6)
+        
+        ttk.Label(info_frame, 
+                 text="寒星",
+                 font=("Microsoft YaHei UI", 10)).grid(row=0, column=1, sticky="w", pady=6)
+        
+        # 项目主页
+        ttk.Label(info_frame, 
+                 text="项目主页",
+                 font=("Microsoft YaHei UI", 10, "bold"),
+                 foreground="#777777").grid(row=1, column=0, sticky="w", padx=(0, 20), pady=6)
+        
+        # 链接标签
+        link_label = ttk.Label(info_frame, 
+                              text="github.com/hxlive/MacroAssistant",
+                              font=("Microsoft YaHei UI", 10),
+                              foreground="#0066CC",
+                              cursor="hand2")
+        link_label.grid(row=1, column=1, sticky="w", pady=6)
+        
+        # 绑定点击事件
+        link_label.bind("<Button-1>", 
+                       lambda e: webbrowser.open("https://github.com/hxlive/MacroAssistant/"))
+        
+        # 鼠标悬停效果
+        def on_enter(e):
+            link_label.config(font=("Microsoft YaHei UI", 10, "underline"), foreground="#0052A3")
+        def on_leave(e):
+            link_label.config(font=("Microsoft YaHei UI", 10), foreground="#0066CC")
+        
+        link_label.bind("<Enter>", on_enter)
+        link_label.bind("<Leave>", on_leave)
+        
+        # ========== 分隔线 ==========
+        separator2 = ttk.Separator(main_frame, orient='horizontal')
+        separator2.pack(fill='x', pady=(0, 18))
+        
+        # ========== 底部：操作按钮区域 ==========
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        # 关闭按钮 - 居中显示
+        close_btn = ttk.Button(button_frame, 
+                              text="确  定",
+                              command=about_dialog.destroy,
+                              bootstyle="primary",
+                              width=18,
+                              padding=(15, 8))
+        close_btn.pack(anchor="center")
+        
+        # 对话框销毁时清理引用
+        def on_dialog_destroy(event=None):
+            self._about_dialog_ref = None
+        
+        about_dialog.bind("<Destroy>", on_dialog_destroy)
+        
+        # ESC键和回车键关闭
+        about_dialog.bind("<Escape>", lambda e: about_dialog.destroy())
+        about_dialog.bind("<Return>", lambda e: about_dialog.destroy())
+
 
     def on_exit(self):
         self.is_app_running = False
