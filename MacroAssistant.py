@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 # MacroAssistant.py
 # 描述: 自动化宏的 GUI 界面
-# 版本: 1.58.0
+# 版本: 1.60.0
 # 变更: (新增) 关于窗口和信息。
 #       (修改) 重新设计程序图标。
+# 使用: 
+#   - GUI 模式: python MacroAssistant.py
+#   - 命令行: python MacroAssistant.py script.json
+#             python MacroAssistant.py --run script.json
+#             python MacroAssistant.py --theme darkly (指定主题)
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -47,7 +52,7 @@ except ImportError:
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.58.0"
+APP_VERSION = "1.60.0"
 APP_TITLE = f"宏助手 (Macro Assistant) V{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 CONFIG_FILE = "macro_settings.json"
@@ -112,6 +117,7 @@ def get_icon_path():
 try:
     import core_engine as macro_engine
     import ocr_engine
+    import vlm_engine
     from core_engine import HotkeyUtils, MacroSchema
     # [变更] 导入重构后的 gui_utils 组件
     import gui_utils
@@ -122,7 +128,8 @@ try:
         ImageTooltipManager, 
         MouseTracker, 
         AutoWrapLabel, 
-        parse_region_string
+        parse_region_string,
+        VLMSettingsDialog
     )
 except ImportError as e:
     messagebox.showerror("导入错误", f"缺少必要的模块文件或导入失败: {e}\n请确保 core_engine.py, ocr_engine.py, gui_utils.py 都在同一目录。")
@@ -395,6 +402,8 @@ class MacroApp:
         settings_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
         self.menu_bar.add_cascade(label="  设置  ", menu=settings_menu)
         settings_menu.add_command(label="⌨️ 快捷键设置...", command=self.open_hotkey_settings)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="🤖  AI 设置...", command=self.open_vlm_settings)
 
         theme_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
         self.menu_bar.add_cascade(label="  主题  ", menu=theme_menu)
@@ -447,9 +456,9 @@ class MacroApp:
         self.steps_tree.heading("params", text="参数详情 / 备注")
         
         # 优化列宽：缩小序号列，适当缩小动作列，扩大参数列
-        self.steps_tree.column("id", width=40, minwidth=35, stretch=False, anchor="center")
-        self.steps_tree.column("action", width=300, minwidth=120, stretch=False)
-        self.steps_tree.column("params", width=280, minwidth=250, stretch=True)
+        self.steps_tree.column("id", width=45, minwidth=40, stretch=False, anchor="center")
+        self.steps_tree.column("action", width=220, minwidth=200, stretch=False)
+        self.steps_tree.column("params", width=320, minwidth=280, stretch=True)
         
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.steps_tree.yview)
         self.steps_tree.configure(yscrollcommand=scrollbar.set)
@@ -462,6 +471,7 @@ class MacroApp:
         
         # 配置编辑行的样式
         self.steps_tree.tag_configure('editing', background='#FFF3CD')
+        # 备注行使用与其他行相同的样式
 
         left_bottom_frame = ttk.Frame(list_frame)
         left_bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10,0))
@@ -632,6 +642,14 @@ class MacroApp:
         
         self.restart_hotkey_listener()
         self.update_status_bar_hotkeys()
+
+    def open_vlm_settings(self):
+        """打开 VLM (AI) 设置对话框"""
+        dialog = VLMSettingsDialog(self.root)
+        self.root.wait_window(dialog.dialog)
+        
+        if dialog.result:
+            messagebox.showinfo("设置已保存", "AI 配置已更新", parent=self.root)
 
     def show_about_dialog(self):
         """显示关于对话框"""
@@ -906,10 +924,27 @@ class MacroApp:
         elif action_key == 'PRESS_KEY':
             self.create_param_entry("key", "按键或组合键 (Enter, Ctrl+C):", "Enter")
         
+        elif action_key == 'AI_COMMAND':
+            # AI 自然语言指令
+            self.create_param_entry("instruction", "AI 指令:", "点击列表里价格最低的那个商品")
+            self.create_region_selector()
+            self._create_hint_label(self.param_frame, 
+                "* 提示: 输入自然语言指令，如 '点击确定按钮'\n"
+                "* AI 会分析屏幕截图，理解指令并返回坐标\n"
+                "* 支持: OpenAI, Anthropic, DeepSeek, 智谱, 通义千问等")
+            self.create_test_button("🧪 测试 AI 指令", self.on_test_ai_command_click)
+        
         elif action_key == 'ACTIVATE_WINDOW':
             self.create_param_entry("title", "窗口标题 (支持部分匹配):", "记事本")
             self._create_hint_label(self.param_frame, "* 提示: 宏将查找标题中包含此文本的窗口，并将其激活到最前端。")
-
+        
+        elif action_key == 'NOTE':
+            # 备注（仅用于注释，不执行任何操作）
+            self.create_param_entry("text", "备注内容:", "这里是需要备注的文本...")
+            self._create_hint_label(self.param_frame, 
+                "* 注意: 此步骤仅作为注释，不会执行任何操作。\n"
+                "* 可用于标注宏的执行流程，方便理解和定位。")
+        
         elif action_key == 'MOVE_TO':
             self.create_param_entry("x", "X 坐标:", "100")
             self.create_param_entry("y", "Y 坐标:", "100")
@@ -1178,6 +1213,46 @@ class MacroApp:
             self.root.after(2000, lambda: self._run_test_thread(self._test_find_text, (text, lang, engine, region_box)))
         except: messagebox.showerror("错误", "参数无效")
 
+    def on_test_ai_command_click(self):
+        """测试 AI 自然语言指令"""
+        try:
+            instruction = self.param_widgets['instruction'].get()
+            if not instruction.strip():
+                messagebox.showwarning("输入错误", "请输入 AI 指令")
+                return
+            
+            # 读取区域
+            region_box = None
+            if 'region' in self.param_widgets:
+                val = self.param_widgets['region'].get().strip()
+                region_box = parse_region_string(val)
+            
+            self.status_var.set("AI 分析中...")
+            self.root.iconify()
+            self.root.after(2000, lambda: self._run_test_thread(self._test_ai_command, (instruction, region_box)))
+        except: messagebox.showerror("错误", "参数无效")
+
+    def _test_ai_command(self, instruction, region_box=None):
+        """后台执行 AI 指令测试"""
+        try:
+            coords = vlm_engine.find_location_by_vlm(instruction, region=region_box)
+            self.root.after(0, lambda: self._on_test_ai_complete(coords))
+        except Exception as e:
+            self.root.after(0, lambda err=e: self._on_test_error(err))
+
+    def _on_test_ai_complete(self, coords):
+        """AI 测试完成回调"""
+        self.root.deiconify()
+        self.root.attributes('-topmost', True)
+        if coords and len(coords) >= 2:
+            self.last_test_location = (coords[0], coords[1])
+            pyautogui.moveTo(coords[0], coords[1])
+            messagebox.showinfo("AI 成功", f"找到坐标: {self.last_test_location}\n\nAI 已移动鼠标到该位置")
+        else:
+            messagebox.showwarning("AI 失败", "未能从 AI 获取有效坐标\n\n请检查:\n1. API Key 是否正确配置\n2. 网络是否正常\n3. 指令是否清晰")
+        self.update_status_bar_hotkeys()
+        self.root.attributes('-topmost', False)
+
     def _run_test_thread(self, func, args):
         threading.Thread(target=func, args=args, daemon=True).start()
 
@@ -1215,12 +1290,28 @@ class MacroApp:
     def _on_test_complete(self, loc):
         self.root.deiconify()
         self.root.attributes('-topmost', True)
+        
+        x, y = None, None
+        
         if loc and len(loc) >= 2:
-            self.last_test_location = (loc[0], loc[1])
-            pyautogui.moveTo(loc[0], loc[1])
+            # 兼容两种格式:
+            # 1. (x, y) - 图像查找返回
+            # 2. ((x, y), text) - OCR返回
+            first = loc[0]
+            if isinstance(first, tuple) and len(first) >= 2:
+                # 格式2: ((x, y), text)
+                x, y = first[0], first[1]
+            else:
+                # 格式1: (x, y)
+                x, y = loc[0], loc[1]
+        
+        if x is not None and y is not None:
+            self.last_test_location = (x, y)
+            pyautogui.moveTo(x, y)
             messagebox.showinfo("成功", f"找到于 {self.last_test_location}")
         else:
             messagebox.showwarning("失败", "未找到目标")
+        
         self.update_status_bar_hotkeys()
         self.root.attributes('-topmost', False)
 
@@ -1262,7 +1353,7 @@ class MacroApp:
                 if not val:
                     if k == 'region': pass # region 允许为空
                     elif k == 'extract_pattern': pass # 正则允许为空
-                    elif action in ['ELSE', 'END_IF', 'END_LOOP']: continue
+                    elif action in ['ELSE', 'END_IF', 'END_LOOP', 'NOTE']: continue
                     elif action == 'SCROLL' and k in ['x', 'y']: continue
                     else: return
                 
@@ -1492,6 +1583,11 @@ class MacroApp:
             param_text = f"{cache_str}{display_params}" if display_params else ""
             
             action_label = MacroSchema.ACTION_TRANSLATIONS.get(act, act)
+            
+            # 备注动作特殊处理：显示为注释格式
+            if act == 'NOTE':
+                note_text = step['params'].get('text', '')
+                param_text = f"// {note_text}" if note_text else "// (空备注)"
             
             # 插入行 (Values对应: id, action, params)
             item_id = self.steps_tree.insert("", "end", values=(
@@ -1780,7 +1876,21 @@ class MacroApp:
         f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
         if f:
             try:
-                with open(f, 'w', encoding='utf-8') as file: json.dump(self.steps, file, indent=4)
+                # 将所有 numpy 类型转换为 Python 原生类型
+                def convert_to_native(obj):
+                    """递归转换所有值为 Python 原生类型"""
+                    import numpy as np
+                    if isinstance(obj, dict):
+                        return {k: convert_to_native(v) for k, v in obj.items()}
+                    elif isinstance(obj, list):
+                        return [convert_to_native(item) for item in obj]
+                    elif isinstance(obj, (np.integer, np.floating)):
+                        return obj.item()  # numpy int/float -> Python int/float
+                    else:
+                        return obj
+                
+                native_steps = convert_to_native(self.steps)
+                with open(f, 'w', encoding='utf-8') as file: json.dump(native_steps, file, indent=4)
                 messagebox.showinfo("成功", "宏已保存！")
                 self.add_to_recent_files(f)
             except Exception as e: messagebox.showerror("失败", str(e))
@@ -1960,12 +2070,64 @@ class MacroApp:
 
 
 if __name__ == "__main__":
-    pyautogui.FAILSAFE = False
-    try:
-        theme = "litera"
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f: theme = json.load(f).get('theme', 'litera')
-    except: pass
-    main_window = tb.Window(themename=theme)
-    app = MacroApp(main_window)
-    main_window.mainloop()
+    import argparse
+    
+    # 命令行参数解析
+    parser = argparse.ArgumentParser(description='MacroAssistant - 自动化宏工具')
+    parser.add_argument('script_file', nargs='?', help='要执行的脚本文件 (.json)')
+    parser.add_argument('--run', dest='run', help='执行指定脚本文件 (效果同直接传参)')
+    parser.add_argument('--theme', dest='theme', default='litera', help='指定主题')
+    args = parser.parse_args()
+    
+    # 确定要执行的脚本
+    script_file = args.script_file or args.run
+    
+    if script_file:
+        # 命令行模式：执行脚本
+        if not os.path.exists(script_file):
+            print(f"错误: 找不到脚本文件 {script_file}")
+            sys.exit(1)
+        
+        print(f"[命令行] 准备执行脚本: {script_file}")
+        
+        try:
+            # 加载脚本
+            with open(script_file, 'r', encoding='utf-8') as f:
+                script_data = json.load(f)
+            
+            # 支持两种格式:
+            # 1. {"steps": [...]} - GUI 导出的格式
+            # 2. [...] - 直接是步骤列表
+            if isinstance(script_data, list):
+                steps = script_data
+            else:
+                steps = script_data.get('steps', [])
+            
+            if not steps:
+                print("错误: 脚本中没有步骤")
+                sys.exit(1)
+            
+            # 执行脚本
+            print(f"[命令行] 共 {len(steps)} 个步骤，开始执行...")
+            result = macro_engine.execute_steps(steps)
+            
+            if result:
+                print("[命令行] 脚本执行成功")
+            else:
+                print("[命令行] 脚本执行失败")
+                sys.exit(1)
+                
+        except Exception as e:
+            print(f"执行错误: {e}")
+            sys.exit(1)
+    else:
+        # GUI 模式
+        pyautogui.FAILSAFE = False
+        try:
+            theme = args.theme
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f: theme = json.load(f).get('theme', 'litera')
+        except: pass
+        main_window = tb.Window(themename=theme)
+        app = MacroApp(main_window)
+        main_window.mainloop()

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # gui_utils.py
 # 描述：GUI 辅助工具库 (重构版 - 样式完美还原)
-# 版本：1.2.6
+# 版本：1.3.0
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -9,6 +9,7 @@ import pyautogui
 from PIL import Image, ImageTk
 import os
 import time
+import base64
 
 # 引入核心库中的工具用于处理快捷键显示
 try:
@@ -422,3 +423,215 @@ class HotkeySettingsDialog:
                 if part not in valid_keys:
                     return False
         return True
+
+
+# =================================================================
+# 8. VLM (AI) 设置对话框
+# =================================================================
+class VLMSettingsDialog:
+    """VLM AI 配置对话框"""
+    def __init__(self, parent):
+        self.result = None
+        
+        # 加载当前配置
+        try:
+            import vlm_engine
+            self.current_config = vlm_engine.load_config()
+            self.providers = vlm_engine.get_providers()
+            self.font_ui = ("Microsoft YaHei UI", 10)
+        except ImportError as e:
+            from .vlm_engine import DEFAULT_CONFIG, get_providers
+            self.current_config = DEFAULT_CONFIG.copy()
+            self.providers = get_providers()
+            self.font_ui = ("Microsoft YaHei UI", 10)
+        
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("🤖 AI 配置设置")
+        self.dialog.geometry("520x660")
+        self.dialog.resizable(False, False)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        # 居中
+        self.dialog.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.dialog.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.dialog.winfo_height()) // 2
+        self.dialog.geometry(f"+{x}+{y}")
+        
+        main_frame = ttk.Frame(self.dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 标题
+        ttk.Label(main_frame, text="🤖 AI 大模型配置", font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(0, 15))
+        
+        # 提供商选择
+        provider_frame = ttk.Labelframe(main_frame, text="AI 提供商", padding=10)
+        provider_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.provider_var = tk.StringVar(value=self.current_config.get('provider', 'openai'))
+        
+        provider_names = []
+        for key, cfg in self.providers.items():
+            provider_names.append(f"{cfg['name']} ({key})")
+        
+        self.provider_combo = ttk.Combobox(provider_frame, values=provider_names, state="readonly", 
+                                           textvariable=self.provider_var, font=self.font_ui)
+        self.provider_combo.pack(fill=tk.X)
+        self.provider_combo.bind("<<ComboboxSelected>>", self.on_provider_change)
+        
+        # API Key
+        key_frame = ttk.Labelframe(main_frame, text="API Key", padding=10)
+        key_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.api_key_var = tk.StringVar(value=self.current_config.get('api_key', ''))
+        key_entry = ttk.Entry(key_frame, textvariable=self.api_key_var, font=self.font_ui, show="*")
+        key_entry.pack(fill=tk.X)
+        
+        # 显示/隐藏 API Key
+        self.show_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(key_frame, text="显示 API Key", variable=self.show_key_var, 
+                       command=lambda: key_entry.config(show="" if self.show_key_var.get() else "*")).pack(anchor="w", pady=(5, 0))
+        
+        # 模型选择
+        model_frame = ttk.Labelframe(main_frame, text="模型 (可选)", padding=10)
+        model_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.model_var = tk.StringVar(value=self.current_config.get('model', ''))
+        model_entry = ttk.Entry(model_frame, textvariable=self.model_var, font=self.font_ui)
+        model_entry.pack(fill=tk.X)
+        ttk.Label(model_frame, text="留空则使用默认值", font=("Microsoft YaHei UI", 8), foreground="gray").pack(anchor="w")
+        
+        # 超时设置
+        timeout_frame = ttk.Labelframe(main_frame, text="超时时间 (秒)", padding=10)
+        timeout_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.timeout_var = tk.IntVar(value=self.current_config.get('timeout', 30))
+        ttk.Spinbox(timeout_frame, from_=10, to=120, textvariable=self.timeout_var, font=self.font_ui).pack(fill=tk.X)
+        
+        # 按钮
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(15, 0))
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+        btn_frame.columnconfigure(2, weight=1)
+        
+        ttk.Button(btn_frame, text="取消", command=self.dialog.destroy, 
+                  bootstyle="secondary", padding=(10, 8)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(btn_frame, text="测试连接", command=self.test_connection, 
+                  bootstyle="info", padding=(10, 8)).grid(row=0, column=1, sticky="ew", padx=3)
+        ttk.Button(btn_frame, text="保存", command=self.save, 
+                  bootstyle="primary", padding=(10, 8)).grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        
+        # 提示
+        ttk.Label(main_frame, text="用法: 输入 API Key，选择提供商，保存即可使用 AI 指令动作", 
+                 font=("Microsoft YaHei UI", 8), foreground="#666", justify=tk.LEFT).pack(pady=(10, 0))
+        
+        # 更新默认模型
+        self.on_provider_change(None)
+    
+    def on_provider_change(self, event):
+        """提供商变更时更新默认模型"""
+        selected = self.provider_var.get()
+        # 提取 provider key
+        provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected.split()[-1]
+        
+        if provider_key in self.providers:
+            default_model = self.providers[provider_key].get('model', '')
+            if not self.model_var.get():
+                self.model_var.set(default_model)
+    
+    def test_connection(self):
+        """测试 API 连接"""
+        import vlm_engine
+        
+        selected = self.provider_var.get()
+        provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected.split()[-1]
+        
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("提示", "请先输入 API Key", parent=self.dialog)
+            return
+        
+        # 构建临时配置
+        config = vlm_engine.DEFAULT_CONFIG.copy()
+        config['provider'] = provider_key
+        config['api_key'] = api_key
+        config['timeout'] = self.timeout_var.get()
+        
+        if self.model_var.get().strip():
+            config['model'] = self.model_var.get().strip()
+        elif provider_key in self.providers:
+            config['model'] = self.providers[provider_key].get('model', '')
+        
+        if provider_key in self.providers:
+            config['base_url'] = self.providers[provider_key].get('base_url', '')
+        
+        # 显示测试中
+        self.dialog.config(cursor="watch")
+        self.dialog.update()
+        
+        try:
+            # 截取当前屏幕进行测试
+            from PIL import ImageGrab
+            import io
+            
+            screenshot = ImageGrab.grab()
+            buffer = io.BytesIO()
+            screenshot.save(buffer, format='JPEG', quality=85)
+            image_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            
+            print(f"[测试] 图片 Base64 长度: {len(image_b64)}")
+            
+            # 修改 system_prompt 为空，避免返回 none
+            original_prompt = config.get('system_prompt', '')
+            config['system_prompt'] = "你是一个助手，直接回答用户问题即可。"
+            
+            # 调用 API 测试 - 使用更简单的指令
+            coords = vlm_engine.call_vlm_api(
+                "这是一个屏幕截图，请描述你看到了什么？",
+                image_b64=image_b64,
+                config=config
+            )
+            
+            # 恢复原始 prompt
+            config['system_prompt'] = original_prompt
+            
+            # 只要有响应就算成功（不管是否有坐标）
+            print(f"[测试] 返回结果: {coords}")
+            messagebox.showinfo("成功", "API 连接成功！\n\n可以正常使用 AI 指令动作。", parent=self.dialog)
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"连接失败:\n\n{str(e)}", parent=self.dialog)
+        finally:
+            self.dialog.config(cursor="")
+    
+    def save(self):
+        """保存配置"""
+        import vlm_engine
+        
+        # 提取 provider key
+        selected = self.provider_var.get()
+        provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected.split()[-1]
+        
+        # 获取默认配置
+        config = vlm_engine.DEFAULT_CONFIG.copy()
+        config['provider'] = provider_key
+        config['api_key'] = self.api_key_var.get().strip()
+        config['timeout'] = self.timeout_var.get()
+        
+        # 模型 (使用默认值或用户输入)
+        if self.model_var.get().strip():
+            config['model'] = self.model_var.get().strip()
+        elif provider_key in self.providers:
+            config['model'] = self.providers[provider_key].get('model', '')
+        
+        # base_url
+        if provider_key in self.providers:
+            config['base_url'] = self.providers[provider_key].get('base_url', '')
+        
+        # 保存
+        if vlm_engine.save_config(config):
+            self.result = config
+            self.dialog.destroy()
+        else:
+            messagebox.showerror("错误", "保存配置失败", parent=self.dialog)

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
 # 描述:自动化宏的核心功能引擎
-# 版本:1.56.0
+# 版本:1.60.0
 # 变更:(修复) 条件循环迭代计数混乱问题、UI快速恢复问题
 
 import pyautogui
@@ -45,6 +45,14 @@ except ImportError:
         WINOCR_AVAILABLE = False
         TESSERACT_AVAILABLE = False
         RAPIDOCR_AVAILABLE = False
+
+try:
+    import vlm_engine
+except ImportError:
+    print("[配置] ✗ 未找到 'vlm_engine.py'。AI 自然语言指令功能将不可用。")
+    class vlm_engine:
+        def find_location_by_vlm(*args, **kwargs): return None
+        VLM_AVAILABLE = False
 
 try:
     import cv2
@@ -117,13 +125,15 @@ class MacroSchema:
         'WAIT':           '07. 等待',
         'TYPE_TEXT':      '08. 输入文本',
         'PRESS_KEY':      '09. 按下按键',
-        'ACTIVATE_WINDOW':'10. 激活窗口 (按标题)',
-        'IF_IMAGE_FOUND': '11. IF 找到图像',
-        'IF_TEXT_FOUND':  '12. IF 找到文本',
-        'ELSE':           '13. ELSE',
-        'END_IF':         '14. END_IF',
-        'LOOP_START':     '15. 循环开始 (Loop)',
-        'END_LOOP':       '16. 结束循环 (EndLoop)',
+        'AI_COMMAND':     '10. AI 自然语言指令',
+        'ACTIVATE_WINDOW':'11. 激活窗口 (按标题)',
+        'NOTE':           "12. 备注",
+        'IF_IMAGE_FOUND': '13. IF 找到图像',
+        'IF_TEXT_FOUND':  '14. IF 找到文本',
+        'ELSE':           '15. ELSE',
+        'END_IF':         '16. END_IF',
+        'LOOP_START':     '17. 循环开始 (Loop)',
+        'END_LOOP':       '18. 结束循环 (EndLoop)',
     }
     ACTION_KEYS_TO_NAME = {v: k for k, v in ACTION_TRANSLATIONS.items()}
     
@@ -335,6 +345,35 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         target_x, target_y = res[0], res[1]
                         pyautogui.moveTo(target_x, target_y)
                 
+                elif act == 'AI_COMMAND':
+                    # AI 自然语言指令处理
+                    instruction = p.get('instruction', '')
+                    if not instruction:
+                        print("  [错误] AI 指令为空")
+                        break
+                    
+                    # 获取可选的区域参数
+                    region = None
+                    if 'cache_box' in p:
+                        cb = p['cache_box']
+                        if isinstance(cb, list) and len(cb) >= 4:
+                            region = tuple(cb)
+                    
+                    print(f"  [AI] 执行指令: {instruction}")
+                    
+                    # 调用 VLM 引擎
+                    coords = vlm_engine.find_location_by_vlm(instruction, region=region)
+                    
+                    if coords:
+                        target_x, target_y = coords
+                        print(f"  [AI] 返回坐标: ({target_x}, {target_y})")
+                        pyautogui.moveTo(target_x, target_y, duration=float(p.get('duration', 0.25)))
+                        ctx['last_pos'] = (target_x, target_y)
+                    else:
+                        print("  [AI] 未找到目标位置")
+                        if p.get('fail_stop', True):  # 默认失败时停止
+                            break
+                
                 elif act == 'CLICK':
                     btn = p.get('button', 'left').lower()
                     clicks = int(p.get('clicks', 1))
@@ -425,7 +464,14 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     except Exception as e:
                         print(f"  [错误] 激活窗口时出错: {e}")
                         break
-
+                
+                elif act == 'NOTE':
+                    # 备注动作 - 仅打印注释，不执行任何操作
+                    note_text = p.get('text', '')
+                    if note_text:
+                        print(f"  [备注] {note_text}")
+                    continue  # 跳过，不更新任何状态
+                
                 elif act == 'ELSE': 
                     next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['END_IF'])
                 
@@ -759,4 +805,4 @@ def _check_loop_condition(loop_data, ctx):
     
     return False
 
-core_engine_version = f"1.56.0 (Core) / OpenCV: {OPENCV_AVAILABLE}"
+core_engine_version = f"1.60.0 (Core) / OpenCV: {OPENCV_AVAILABLE}"
