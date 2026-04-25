@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
 # 描述:自动化宏的核心功能引擎
-# 版本:1.60.0
+# 版本:1.5.6
 # 变更:(修复) 条件循环迭代计数混乱问题、UI快速恢复问题
 
 import pyautogui
@@ -233,13 +233,14 @@ def _get_template(path, scale):
         img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
     return img, img.shape[1], img.shape[0]
 
-def find_image_cv2(path, conf, screenshot_pil, offset=(0,0)):
+def find_image_cv2(path, conf, screenshot_pil, offset=(0,0), enhanced_mode=False):
     if not OPENCV_AVAILABLE: return None
     try:
         t0 = time.time()
         screen_gray = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2GRAY)
         best = (-1, None, 0, 0)
-        for scale in SCALES:
+        scales_to_try = SCALES if enhanced_mode else [1.0]
+        for scale in scales_to_try:
             tmpl, tw, th = _get_template(path, scale)
             if tmpl is None or th > screen_gray.shape[0] or tw > screen_gray.shape[1]: continue
             res = cv2.matchTemplate(screen_gray, tmpl, cv2.TM_CCOEFF_NORMED)
@@ -255,7 +256,7 @@ def find_image_cv2(path, conf, screenshot_pil, offset=(0,0)):
         print(f"CV2找图错误: {e}")
     return None
 
-def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc):
+def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc, enhanced_mode=False):
     """
     [补丁优化] 快速检查图片是否仍在缓存位置
     
@@ -267,6 +268,7 @@ def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc):
         screenshot_pil: PIL截图对象
         offset: 截图偏移量 (x, y)
         target_loc: 目标位置 (x, y)
+        enhanced_mode: 是否启用增强模式
         
     Returns:
         bool: 是否在目标位置找到图片
@@ -274,7 +276,8 @@ def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc):
     if not OPENCV_AVAILABLE: return False
     try:
         # [补丁优化] 尝试多个缩放比例，避免因缩放不匹配导致误判
-        for scale in QUICK_CHECK_SCALES:
+        scales_to_try = QUICK_CHECK_SCALES if enhanced_mode else [1.0]
+        for scale in scales_to_try:
             tmpl, tw, th = _get_template(path, scale)
             if tmpl is None: continue
             
@@ -327,6 +330,16 @@ def execute_steps(steps, run_context=None, status_callback=None):
             step = steps[pc]; act = step.get('action',''); p = step.get('params',{})
             print(f"[{pc+1}] {act}")
             next_pc = pc + 1
+
+            # [新增] 处理被屏蔽的普通步骤
+            if not step.get('enabled', True):
+                if act not in ['IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'ELSE', 'END_IF', 'LOOP_START', 'END_LOOP']:
+                    print(f"  [屏蔽] 跳过步骤: {act}")
+                    pc = next_pc
+                    continue
+                else:
+                    # 保护机制: 控制流节点强制执行，忽略屏蔽标志
+                    pass
 
             try:
                 # [关键] 每次循环初始化结果变量
@@ -470,7 +483,9 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     note_text = p.get('text', '')
                     if note_text:
                         print(f"  [备注] {note_text}")
-                    continue  # 跳过，不更新任何状态
+                    # 注意：必须更新 pc，否则会无限循环
+                    pc = next_pc
+                    continue
                 
                 elif act == 'ELSE': 
                     next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['END_IF'])
@@ -557,14 +572,16 @@ def _handle_find(act, p, ctx, in_loop):
     ss, offset = smart_screenshot(region)
     sig = f"{act}_{p.get('path', p.get('text',''))}"
 
+    enhanced_mode = ctx.get('enhanced_mode', False)
+
     if in_loop:
         cached = loop_cache.get(sig)
-        if cached and is_img and quick_check_cv2(p['path'], float(p.get('confidence',0.8)), ss, offset, cached):
+        if cached and is_img and quick_check_cv2(p['path'], float(p.get('confidence',0.8)), ss, offset, cached, enhanced_mode):
             perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
 
     res = _do_find(is_img, p, ss, offset, final_engine, ctx)
     
-    if not res and region and ENABLE_GLOBAL_FALLBACK:
+    if not res and region and ENABLE_GLOBAL_FALLBACK and enhanced_mode:
         print("  [缓存失效] 全局搜索...")
         ss, offset = smart_screenshot(None)
         res = _do_find(is_img, p, ss, offset, final_engine, ctx)
@@ -585,9 +602,10 @@ def _handle_find(act, p, ctx, in_loop):
 
 def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
     """执行查找（图像或文本）并返回统一格式坐标 (x, y)"""
+    enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
     if is_img:
         # 图片查找返回: (cx, cy, w, h)
-        res_val = find_image_cv2(p['path'], float(p.get('confidence', 0.8)), ss, offset)
+        res_val = find_image_cv2(p['path'], float(p.get('confidence', 0.8)), ss, offset, enhanced_mode)
         if res_val:
             perf.record_hit(False, False)
             print(f"  [找到] 图 ({res_val[0][0]},{res_val[0][1]})")
@@ -598,7 +616,7 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
             p['text'], 
             p.get('lang','eng'), 
             p.get('debug',True), 
-            ss, offset, engine
+            ss, offset, engine, enhanced_mode
         )
         
         if res:
@@ -766,7 +784,8 @@ def _check_loop_condition(loop_data, ctx):
         
         try:
             ss = ImageGrab.grab()
-            res_val = find_image_cv2(path, conf, ss, offset=(0, 0))
+            enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
+            res_val = find_image_cv2(path, conf, ss, offset=(0, 0), enhanced_mode=enhanced_mode)
             found = res_val is not None
             if found:
                 print(f"  [Loop Until] ✓✓✓ 找到目标图像: {os.path.basename(path)}")
@@ -788,7 +807,8 @@ def _check_loop_condition(loop_data, ctx):
         try:
             ss = ImageGrab.grab()
             # 兼容新的返回格式
-            res = ocr_engine.find_text_location(text, lang, False, ss, (0, 0), 'auto')
+            enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
+            res = ocr_engine.find_text_location(text, lang, False, ss, (0, 0), 'auto', enhanced_mode)
             
             if res:
                 # [优化] 打印识别到的具体文本
@@ -805,4 +825,4 @@ def _check_loop_condition(loop_data, ctx):
     
     return False
 
-core_engine_version = f"1.60.0 (Core) / OpenCV: {OPENCV_AVAILABLE}"
+core_engine_version = f"1.5.6 (Core) / OpenCV: {OPENCV_AVAILABLE}"
