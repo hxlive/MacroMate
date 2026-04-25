@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # MacroAssistant.py
 # 描述: 自动化宏的 GUI 界面
-# 版本: 1.60.0
+# 版本: 1.6.1
 # 变更: (新增) 关于窗口和信息。
 #       (修改) 重新设计程序图标。
 # 使用: 
@@ -52,7 +52,7 @@ except ImportError:
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.60.0"
+APP_VERSION = "1.6.1"
 APP_TITLE = f"宏助手 (Macro Assistant) V{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 CONFIG_FILE = "macro_settings.json"
@@ -343,6 +343,7 @@ class MacroApp:
         self.current_theme = tb.StringVar(value=self.root.style.theme_use())
         self.skip_confirm_var = tb.BooleanVar(value=False)
         self.dont_minimize_var = tb.BooleanVar(value=False)
+        self.enhanced_mode_var = tb.BooleanVar(value=True)
         self.recent_files = []
         self.status_queue = queue.Queue()
         
@@ -469,8 +470,14 @@ class MacroApp:
         # 绑定事件
         self.steps_tree.bind("<Double-1>", lambda e: self.load_step_for_edit())
         
+        # [新增] 右键菜单
+        self.tree_menu = tk.Menu(self.root, tearoff=0, font=self.font_ui)
+        self.tree_menu.add_command(label="屏蔽/启用选中步骤", command=self.toggle_step_enabled)
+        self.steps_tree.bind("<Button-3>", self.show_tree_menu)
+        
         # 配置编辑行的样式
         self.steps_tree.tag_configure('editing', background='#FFF3CD')
+        self.steps_tree.tag_configure('disabled', foreground='#999999')
         # 备注行使用与其他行相同的样式
 
         left_bottom_frame = ttk.Frame(list_frame)
@@ -492,12 +499,15 @@ class MacroApp:
         
         check_frame = ttk.Frame(left_bottom_frame)
         check_frame.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
-        check_frame.columnconfigure(0, weight=1); check_frame.columnconfigure(1, weight=1) 
+        check_frame.columnconfigure(0, weight=1); check_frame.columnconfigure(1, weight=1)
         
         skip_check = ttk.Checkbutton(check_frame, text="跳过运行前的确认提示", variable=self.skip_confirm_var, bootstyle="primary-round-toggle")
-        skip_check.grid(row=0, column=0, sticky="w", padx=2) 
+        skip_check.grid(row=0, column=0, sticky="w", padx=2, pady=(0, 5)) 
         minimize_check = ttk.Checkbutton(check_frame, text="运行时主界面不最小化", variable=self.dont_minimize_var, bootstyle="primary-round-toggle")
-        minimize_check.grid(row=0, column=1, sticky="w", padx=2)
+        minimize_check.grid(row=0, column=1, sticky="w", padx=2, pady=(0, 5))
+        
+        enhanced_check = ttk.Checkbutton(check_frame, text="开启增强模式 (多级缩放匹配与 OCR 放大预处理)", variable=self.enhanced_mode_var, bootstyle="success-round-toggle")
+        enhanced_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=2)
         
         # =====================================================================
         # 右侧面板
@@ -1590,15 +1600,27 @@ class MacroApp:
                 param_text = f"// {note_text}" if note_text else "// (空备注)"
             
             # 插入行 (Values对应: id, action, params)
+            is_enabled = step.get('enabled', True)
+            display_action = f"{indent_str}{action_label}"
+            if not is_enabled:
+                display_action = f"{indent_str}[屏蔽] {action_label}"
+                
             item_id = self.steps_tree.insert("", "end", values=(
                 i + 1,
-                f"{indent_str}{action_label}",
+                display_action,
                 param_text
             ))
             
-            # 如果是编辑行，高亮显示 (Tag: editing)
+            tags = []
             if i == self.editing_index:
-                self.steps_tree.item(item_id, tags=('editing',))
+                tags.append('editing')
+            if not is_enabled:
+                tags.append('disabled')
+                
+            if tags:
+                self.steps_tree.item(item_id, tags=tuple(tags))
+                
+            if i == self.editing_index:
                 # 确保滚动可见
                 self.steps_tree.see(item_id)
                 # 保持选中状态 (可选)
@@ -1608,6 +1630,33 @@ class MacroApp:
                 block_stack.append(act)
             elif act in ['END_IF', 'END_LOOP'] and block_stack:
                 block_stack.pop()
+
+    def show_tree_menu(self, event):
+        """显示树形列表右键菜单"""
+        item = self.steps_tree.identify_row(event.y)
+        if item:
+            self.steps_tree.selection_set(item)
+            idx = self._get_selected_index()
+            if idx is not None:
+                act = self.steps[idx].get('action', '')
+                if act in ['IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'ELSE', 'END_IF', 'LOOP_START', 'END_LOOP']:
+                    self.tree_menu.entryconfig("屏蔽/启用选中步骤", state="disabled")
+                else:
+                    self.tree_menu.entryconfig("屏蔽/启用选中步骤", state="normal")
+            self.tree_menu.post(event.x_root, event.y_root)
+
+    def toggle_step_enabled(self):
+        """切换选中步骤的启用/屏蔽状态"""
+        idx = self._get_selected_index()
+        if idx is not None:
+            step = self.steps[idx]
+            act = step.get('action', '')
+            if act in ['IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'ELSE', 'END_IF', 'LOOP_START', 'END_LOOP']:
+                messagebox.showwarning("提示", "不可屏蔽流程控制节点（条件、循环），以防止引发严重 BUG。", parent=self.root)
+                return
+            
+            step['enabled'] = not step.get('enabled', True)
+            self.update_listbox_display()
 
     def remove_step(self):
         # --- 升级: 适配 Treeview ---
@@ -1790,7 +1839,8 @@ class MacroApp:
         self.is_macro_running = True
         self.current_run_context = {
             'stop_requested': False,
-            'stop_key_str': self.hotkey_stop_str.get()
+            'stop_key_str': self.hotkey_stop_str.get(),
+            'enhanced_mode': self.enhanced_mode_var.get()
         }
         threading.Thread(target=self._run, args=(self.steps.copy(),), daemon=True).start()
         
@@ -1890,7 +1940,19 @@ class MacroApp:
                         return obj
                 
                 native_steps = convert_to_native(self.steps)
-                with open(f, 'w', encoding='utf-8') as file: json.dump(native_steps, file, indent=4)
+                
+                # 自定义格式：每行一个步骤对象，便于阅读
+                with open(f, 'w', encoding='utf-8') as file:
+                    file.write('[\n')
+                    for i, step in enumerate(native_steps):
+                        # 去掉默认缩进，使用紧凑格式
+                        step_str = json.dumps(step, ensure_ascii=False)
+                        if i < len(native_steps) - 1:
+                            file.write(f'    {step_str},\n')
+                        else:
+                            file.write(f'    {step_str}\n')
+                    file.write(']\n')
+                
                 messagebox.showinfo("成功", "宏已保存！")
                 self.add_to_recent_files(f)
             except Exception as e: messagebox.showerror("失败", str(e))
@@ -1993,6 +2055,7 @@ class MacroApp:
                     self.current_theme.set(d.get('theme', 'litera'))
                     self.hotkey_run_str.set(d.get('hotkey_run', DEFAULT_HOTKEY_RUN))
                     self.hotkey_stop_str.set(d.get('hotkey_stop', DEFAULT_HOTKEY_STOP))
+                    self.enhanced_mode_var.set(d.get('enhanced_mode', True))
         except:
             pass
         self.root.style.theme_use(self.current_theme.get())
@@ -2005,7 +2068,8 @@ class MacroApp:
                     'recent_files': self.recent_files,
                     'theme': self.current_theme.get(),
                     'hotkey_run': self.hotkey_run_str.get(),
-                    'hotkey_stop': self.hotkey_stop_str.get()
+                    'hotkey_stop': self.hotkey_stop_str.get(),
+                    'enhanced_mode': self.enhanced_mode_var.get()
                 }, f, indent=2)
         except:
             pass

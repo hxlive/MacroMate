@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ocr_engine.py
 # 描述:自动化宏的 OCR 功能引擎
-# 版本:1.55.0
+# 版本:1.5.6
 # 变更:(终极修复) 返回完整识别文本,支持剪贴板功能
 
 from PIL import Image, ImageGrab
@@ -26,6 +26,9 @@ try:
     from rapidocr import RapidOCR
     RAPIDOCR_CLASS = RapidOCR 
 except Exception as e:
+    import traceback
+    print(f"[OCR] RapidOCR 依赖加载失败: {e}")
+    traceback.print_exc()
     pass 
 
 # ======================================================================
@@ -59,11 +62,14 @@ def get_rapid_ocr_engine():
         try:
             print("[OCR] 正在加载 RapidOCR 模型...")
             t0 = time.time()
+            # 恢复标准初始化参数，避免因版本不兼容报错
             _RAPID_OCR_INSTANCE = RAPIDOCR_CLASS()
             print(f"[OCR] RapidOCR 就绪 ({time.time()-t0:.2f}s)")
             return _RAPID_OCR_INSTANCE
         except Exception as e:
-            print(f"[严重错误] RapidOCR 加载失败: {e}")
+            import traceback
+            print(f"[严重错误] RapidOCR 初始化失败: {e}")
+            traceback.print_exc()
             _RAPID_OCR_INIT_FAILED = True
             return None
 
@@ -137,7 +143,7 @@ ocr_stats = OCRPerformanceStats()
 # ======================================================================
 # === 关键修复: 统一查找入口 - 返回完整文本 ===
 # ======================================================================
-def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None, offset=(0,0), engine='auto'):
+def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None, offset=(0,0), engine='auto', enhanced_mode=False):
     """
     查找文本在屏幕上的位置
     
@@ -175,14 +181,14 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
         rapid_inst = get_rapid_ocr_engine()
         if rapid_inst and lang in LANG_MAP['rapidocr']:
             t0 = time.time()
-            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, get_img_bgr(), offset)
+            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, get_img_bgr(), offset, enhanced_mode)
             ocr_stats.record('rapidocr', result is not None, time.time() - t0)
             if result: return result
 
         # 尝试 Tesseract
         if get_tesseract_cmd() and lang in LANG_MAP['tesseract']:
             t0 = time.time()
-            result = _find_text_tesseract(target_norm, LANG_MAP['tesseract'][lang], debug, screenshot_pil, offset)
+            result = _find_text_tesseract(target_norm, LANG_MAP['tesseract'][lang], debug, screenshot_pil, offset, enhanced_mode)
             ocr_stats.record('tesseract', result is not None, time.time() - t0)
             if result: return result
 
@@ -190,7 +196,7 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
         rapid_inst = get_rapid_ocr_engine()
         if rapid_inst and lang in LANG_MAP['rapidocr']:
             t0 = time.time()
-            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, get_img_bgr(), offset)
+            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, get_img_bgr(), offset, enhanced_mode)
             ocr_stats.record('rapidocr', result is not None, time.time() - t0)
             if result: return result
 
@@ -207,7 +213,7 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
     elif engine == 'tesseract':
         if get_tesseract_cmd() and lang in LANG_MAP['tesseract']:
             t0 = time.time()
-            result = _find_text_tesseract(target_norm, LANG_MAP['tesseract'][lang], debug, screenshot_pil, offset)
+            result = _find_text_tesseract(target_norm, LANG_MAP['tesseract'][lang], debug, screenshot_pil, offset, enhanced_mode)
             ocr_stats.record('tesseract', result is not None, time.time() - t0)
             if result: return result
 
@@ -257,9 +263,17 @@ def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_p
         return None
     except: return None
 
-def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset):
+def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset, enhanced_mode=False):
     try:
-        res = inst(img_bgr)
+        # [优化] 针对小字进行缩放预处理 (增强模式为2倍)
+        scale = 2 if enhanced_mode else 1
+        h, w = img_bgr.shape[:2]
+        if scale != 1:
+            img_scaled = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+        else:
+            img_scaled = img_bgr
+        
+        res = inst(img_scaled)
         all_boxes, all_texts, all_scores = [], [], []
         
         if isinstance(res, tuple):
@@ -306,7 +320,7 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset):
         for w in words:
             if target_norm in w['text']:
                 b = w['box']
-                cx, cy = offset[0]+(b[0]+b[2])//2, offset[1]+(b[1]+b[3])//2
+                cx, cy = offset[0] + ((b[0]+b[2])//2)//scale, offset[1] + ((b[1]+b[3])//2)//scale
                 if debug: print(f"  [RapidOCR✓] ({cx}, {cy}) @ {w['score']:.2f}")
                 return ((cx, cy), full_text)
         
@@ -319,8 +333,8 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset):
                 merged += words[j]['text']
                 b_list.append(words[j]['box'])
                 if target_norm == merged:
-                    cx = offset[0] + sum((b[0]+b[2])//2 for b in b_list)//len(b_list)
-                    cy = offset[1] + sum((b[1]+b[3])//2 for b in b_list)//len(b_list)
+                    cx = offset[0] + (sum((b[0]+b[2])//2 for b in b_list)//len(b_list)) // scale
+                    cy = offset[1] + (sum((b[1]+b[3])//2 for b in b_list)//len(b_list)) // scale
                     if debug: print(f"  [RapidOCR✓] 合并 ({cx}, {cy})")
                     return ((cx, cy), full_text)
         return None
@@ -328,21 +342,27 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset):
         if debug: print(f"  [RapidOCR] 解析错误: {e}")
         return None
 
-def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset):
+def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset, enhanced_mode=False):
     try:
         import pytesseract
         if _TESSERACT_CMD: pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
         
-        s = 2 
+        s = 2 if enhanced_mode else 1
         if NUMPY_CV2_AVAILABLE:
             gray = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2GRAY)
             h, w = gray.shape[:2]
-            scaled = cv2.resize(gray, (w*s, h*s), interpolation=cv2.INTER_CUBIC)
+            if s != 1:
+                scaled = cv2.resize(gray, (w*s, h*s), interpolation=cv2.INTER_CUBIC)
+            else:
+                scaled = gray
             bw = cv2.adaptiveThreshold(scaled, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
             img_processed = Image.fromarray(bw)
         else:
             g = screenshot_pil.convert('L')
-            img_processed = g.resize((g.size[0]*s, g.size[1]*s), resample=Image.LANCZOS)
+            if s != 1:
+                img_processed = g.resize((g.size[0]*s, g.size[1]*s), resample=Image.LANCZOS)
+            else:
+                img_processed = g
         
         config = f'-l {lang}'
         if _TESSERACT_TESSDATA: 
@@ -414,4 +434,4 @@ def get_available_engines():
         
     return engines
 
-ocr_engine_version = "1.56.0"
+ocr_engine_version = "1.5.6"
