@@ -1,8 +1,17 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
 # 描述:自动化宏的核心功能引擎
-# 版本:1.5.6
-# 变更:(修复) 条件循环迭代计数混乱问题、UI快速恢复问题
+# 版本:1.6.2
+# # 变更:(修复) 新增 MacroStopException，实现快捷键即时中断
+
+# ======================================================================
+# 即时中断异常
+# ======================================================================
+class MacroStopException(BaseException):
+    """快捷键触发时注入到执行线程的异常，强制立刻中断宏。
+    继承 BaseException 而非 Exception，确保不被 except Exception 误吞。
+    """
+    pass
 
 import pyautogui
 import time
@@ -544,6 +553,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         print("[错误] END_LOOP 缺少对应的 LOOP_START")
                         next_pc = pc + 1  # 继续执行下一步
 
+            except MacroStopException:
+                raise  # 向上传播，不要吞掉
             except Exception as e:
                 print(f"  [执行异常] {e}"); import traceback; traceback.print_exc(); break
             pc = next_pc
@@ -825,4 +836,4 @@ def _check_loop_condition(loop_data, ctx):
     
     return False
 
-core_engine_version = f"1.5.6 (Core) / OpenCV: {OPENCV_AVAILABLE}"
+core_engine_version = f"1.6.2 (Core) / OpenCV: {OPENCV_AVAILABLE}"

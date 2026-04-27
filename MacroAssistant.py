@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 # MacroAssistant.py
 # 描述: 自动化宏的 GUI 界面
-# 版本: 1.6.1
-# 变更: (新增) 关于窗口和信息。
-#       (修改) 重新设计程序图标。
+# 版本: 1.6.2
+# 变更: (新增) 运行时快捷键即时中断 ( MacroStopException)
+
 # 使用: 
 #   - GUI 模式: python MacroAssistant.py
 #   - 命令行: python MacroAssistant.py script.json
@@ -52,8 +52,8 @@ except ImportError:
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.6.1"
-APP_TITLE = f"宏助手 (Macro Assistant) V{APP_VERSION}"
+APP_VERSION = "1.6.2"
+APP_TITLE = f"宏助手 (Macro Assistant) v{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 CONFIG_FILE = "macro_settings.json"
 MAX_RECENT_FILES = 5
@@ -291,7 +291,7 @@ class MacroApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1140x730")  # 稍微加宽以适应优化后的列宽 
+        self.root.geometry("1160x820")  # 稍微加宽以适应优化后的列宽 
         
         self.font_ui = ("Microsoft YaHei UI", 10)
         self.font_code = ("Consolas", 10)
@@ -331,6 +331,7 @@ class MacroApp:
         self.is_macro_running = False
         self.last_test_location = None 
         self.current_run_context = None 
+        self._macro_thread = None          # [新增] 保存执行线程引用以支持强制中断
         self.held_keys = set()
         
         # [新增] 迷你状态栏窗口
@@ -360,26 +361,68 @@ class MacroApp:
             'none': '无可用OCR引擎'
         }
         self.FULL_OCR_KEY_MAP = {name: key for key, name in self.FULL_OCR_NAME_MAP.items()}
-        self.available_ocr_engines = ocr_engine.get_available_engines()
-        self.available_ocr_keys = [e[0] for e in self.available_ocr_engines]
-        
-        if 'none' in self.available_ocr_keys:
-            print("[警告] 未找到任何可用的OCR引擎 (RapidOCR, Tesseract, WinOCR)。")
+        # OCR 引擎检测将在后台线程运行，先用占位值保证主线程快速进入 mainloop
+        self.available_ocr_engines = []   # 后台检测完成前的占位值
+        self.available_ocr_keys = ['auto']
+
+        # ──────────────────────────────────────────────────────────────
+        # 显示 loading，将重型 UI 构建延迟到 mainloop 启动后执行。
+        # 窗口出现时已在事件循环中，不会触发「未响应」。
+        # ──────────────────────────────────────────────────────────────
+        self._splash_label = tk.Label(
+            self.root,
+            text="正在加载界面...",
+            font=("Microsoft YaHei UI", 13),
+            fg="#555555"
+        )
+        self._splash_label.place(relx=0.5, rely=0.5, anchor="center")
+        self.root.after(10, self._deferred_ui_init)
+
+    def _deferred_ui_init(self):
+        """mainloop 已启动后才执行 UI 构建，避免窗口冻结。"""
+        if hasattr(self, '_splash_label') and self._splash_label:
+            self._splash_label.destroy()
+            self._splash_label = None
 
         self._init_menu()
         self._init_ui()
-        
-        # [变更] 初始化悬浮预览管理器 (使用 lambda 动态获取 steps)
+
+        # 初始化悬浮预览管理器
         self.tooltip_manager = ImageTooltipManager(self.steps_tree, lambda: self.steps)
-        
+
         self.load_app_settings()
         self.update_recent_files_menu()
-        self.update_status_bar_hotkeys() 
+        self.update_status_bar_hotkeys()
         self.root.after(500, self.check_hotkey_conflicts)
-        self.start_hotkey_listener() 
-        # [补丁优化] 提前预热OCR引擎，改善首次使用体验
-        self.root.after(OCR_PRELOAD_DELAY, lambda: threading.Thread(target=ocr_engine.preload_engines, daemon=True).start())
+        self.start_hotkey_listener()
+        # OCR 引擎异步检测
+        threading.Thread(target=self._detect_ocr_engines_bg, daemon=True).start()
         self._check_status_queue()
+
+    # ------------------------------------------------------------------
+    # OCR 引擎异步检测（避免阻塞主线程）
+    # ------------------------------------------------------------------
+    def _detect_ocr_engines_bg(self):
+        """后台线程：检测可用 OCR 引擎并预热，完成后回调主线程更新状态。"""
+        try:
+            engines = ocr_engine.get_available_engines()
+            # 检测完成后顺手预热（合并两次后台任务）
+            ocr_engine.preload_engines()
+        except Exception as e:
+            print(f"[OCR] 后台检测异常: {e}")
+            engines = [('none', '无可用OCR引擎')]
+        self.root.after(0, self._on_ocr_engines_ready, engines)
+
+    def _on_ocr_engines_ready(self, engines):
+        """主线程回调：OCR 引擎检测完成，更新状态。"""
+        self.available_ocr_engines = engines
+        self.available_ocr_keys = [e[0] for e in engines]
+        if 'none' in self.available_ocr_keys:
+            print("[警告] 未找到任何可用的OCR引擎 (RapidOCR, Tesseract, WinOCR)。")
+            self.status_var.set("⚠ 未找到可用 OCR 引擎，文本查找功能不可用。")
+        else:
+            engine_names = ' / '.join(e[1] for e in engines)
+            print(f"[OCR] 引擎就绪: {engine_names}")
 
     def _init_menu(self):
         self.menu_bar = tk.Menu(self.root)
@@ -902,13 +945,37 @@ class MacroApp:
             self.create_param_combobox("lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
             self.create_ocr_engine_combobox()
             
-            # === 新增：保存到剪贴板选项 ===
+            # === 保存到剪贴板选项（勾选后才展开从属控件）===
             self.create_param_checkbox("save_to_clipboard", "✓ 保存识别结果到剪贴板", default=False)
-            self.create_param_entry("extract_pattern", "提取模式 (正则，可选):", r"\d+")
-            self._create_hint_label(self.param_frame, 
-                "* 提示: 勾选后，识别到的文本将保存到剪贴板"
-                "* 提取模式: 用正则表达式过滤，如 \\d+ 提取数字")
-            
+
+            # 始终占位的容器（位于 checkbox 下方，测试按钮上方）
+            _sub_ft = ttk.Frame(self.param_frame)
+            _sub_ft.pack(fill=tk.X)  # 永不 pack_forget，保持位置
+
+            # 提取模式输入框
+            _ep_frame_ft = ttk.Frame(_sub_ft)
+            ttk.Label(_ep_frame_ft, text="提取模式 (正则，可选):", font=self.font_ui).pack(anchor="w")
+            _ep_entry_ft = ttk.Entry(_ep_frame_ft, width=25, font=self.font_ui)
+            _ep_entry_ft.insert(0, r"\d+")
+            _ep_entry_ft.pack(anchor="w", fill=tk.X)
+            self.param_widgets['extract_pattern'] = _ep_entry_ft
+
+            # 说明提示
+            _hint_ft = AutoWrapLabel(_sub_ft,
+                text="提取模式: 用正则表达式过滤识别结果，如 \\d+ 只提取数字；留空则保存全部文本。",
+                font=self.font_ui, style="secondary.TLabel")
+
+            # 初始隐藏（内部子件不 pack）
+            def _toggle_ft(var=self.param_widgets['save_to_clipboard'],
+                           ef=_ep_frame_ft, hint=_hint_ft):
+                if var.get():
+                    ef.pack(fill=tk.X, pady=8)
+                    hint.pack(anchor="w", pady=5, fill=tk.X)
+                else:
+                    ef.pack_forget()
+                    hint.pack_forget()
+            self.param_widgets['save_to_clipboard'].trace_add('write', lambda *_: _toggle_ft())
+
             self.create_test_button("🧪 测试查找文本 (OCR)", self.on_test_find_text_click)
             
         elif action_key == 'MOVE_OFFSET':
@@ -978,10 +1045,37 @@ class MacroApp:
             self.create_param_combobox("lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
             self.create_ocr_engine_combobox()
             
-            # === 新增：保存到剪贴板选项 ===
+            # === 保存到剪贴板选项（勾选后才展开从属控件）===
             self.create_param_checkbox("save_to_clipboard", "✓ 保存识别结果到剪贴板", default=False)
-            self.create_param_entry("extract_pattern", "提取模式 (正则，可选):", r"\d+")
-            
+
+            # 始终占位的容器（位于 checkbox 下方，测试按钮上方）
+            _sub_ift = ttk.Frame(self.param_frame)
+            _sub_ift.pack(fill=tk.X)  # 永不 pack_forget，保持位置
+
+            # 提取模式输入框
+            _ep_frame_ift = ttk.Frame(_sub_ift)
+            ttk.Label(_ep_frame_ift, text="提取模式 (正则，可选):", font=self.font_ui).pack(anchor="w")
+            _ep_entry_ift = ttk.Entry(_ep_frame_ift, width=25, font=self.font_ui)
+            _ep_entry_ift.insert(0, r"\d+")
+            _ep_entry_ift.pack(anchor="w", fill=tk.X)
+            self.param_widgets['extract_pattern'] = _ep_entry_ift
+
+            # 说明提示
+            _hint_ift = AutoWrapLabel(_sub_ift,
+                text="提取模式: 用正则表达式过滤识别结果，如 \\d+ 只提取数字；留空则保存全部文本。",
+                font=self.font_ui, style="secondary.TLabel")
+
+            # 初始隐藏（内部子件不 pack）
+            def _toggle_ift(var=self.param_widgets['save_to_clipboard'],
+                            ef=_ep_frame_ift, hint=_hint_ift):
+                if var.get():
+                    ef.pack(fill=tk.X, pady=8)
+                    hint.pack(anchor="w", pady=5, fill=tk.X)
+                else:
+                    ef.pack_forget()
+                    hint.pack_forget()
+            self.param_widgets['save_to_clipboard'].trace_add('write', lambda *_: _toggle_ift())
+
             self.create_test_button("🧪 测试 IF 文本", self.on_test_find_text_click)
             
         elif action_key == 'LOOP_START':
@@ -1801,10 +1895,31 @@ class MacroApp:
             self.root.after(0, self.run_macro, True)
         
     def safe_stop_macro(self):
-        if self.is_macro_running:
-            self.root.after(0, self.status_var.set, "正在停止...")
-            if self.current_run_context: 
-                self.current_run_context['stop_requested'] = True
+        """[即时中断] 通过 ctypes 向执行线程注入异常，无论其封锁在哪个阶段都能立刻中断。"""
+        if not self.is_macro_running:
+            return
+        self.root.after(0, self.status_var.set, "正在停止...")
+        # 同时设置标志位（兼容 WAIT 内的分段检查）
+        if self.current_run_context:
+            self.current_run_context['stop_requested'] = True
+        # 强制向执行线程注入 MacroStopException
+        t = self._macro_thread
+        if t and t.is_alive():
+            tid = t.ident
+            if tid:
+                import ctypes
+                res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(tid),
+                    ctypes.py_object(macro_engine.MacroStopException)
+                )
+                if res == 0:
+                    print("[中断] 警告: 线程 ID 无效，异常未注入")
+                elif res > 1:
+                    # 多个线程被影响，需要撤销
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+                    print("[中断] 警告: 异常影响了多个线程，已撤销")
+                else:
+                    print("[中断] MacroStopException 已弹射到执行线程")
         
     def run_macro(self, hotkey=False):
         if self.is_macro_running or not self.steps: return
@@ -1842,13 +1957,18 @@ class MacroApp:
             'stop_key_str': self.hotkey_stop_str.get(),
             'enhanced_mode': self.enhanced_mode_var.get()
         }
-        threading.Thread(target=self._run, args=(self.steps.copy(),), daemon=True).start()
+        self._macro_thread = threading.Thread(target=self._run, args=(self.steps.copy(),), daemon=True)
+        self._macro_thread.start()
         
     def _run(self, steps):
         try:
             macro_engine.execute_steps(steps, run_context=self.current_run_context, status_callback=self.update_loop_status)
-        except Exception as e: self.root.after(0, lambda err=e: messagebox.showerror("错误", str(err)))
-        finally: self.root.after(0, self._on_macro_complete)
+        except macro_engine.MacroStopException:
+            print("[宏] 已将循环强制中断")
+        except Exception as e:
+            self.root.after(0, lambda err=e: messagebox.showerror("错误", str(err)))
+        finally:
+            self.root.after(0, self._on_macro_complete)
 
     def _on_macro_complete(self):
         self.is_macro_running = False
