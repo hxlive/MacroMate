@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
 # 描述:自动化宏的核心功能引擎
-# 版本:1.6.2
+# 版本:1.6.5
 # # 变更:(修复) 新增 MacroStopException，实现快捷键即时中断
 
 # ======================================================================
@@ -20,6 +20,7 @@ import re
 import pyperclip
 import os
 import sys
+import subprocess
 from collections import defaultdict
 import functools 
 
@@ -28,7 +29,7 @@ try:
     PYGETWINDOW_AVAILABLE = True
 except ImportError:
     PYGETWINDOW_AVAILABLE = False
-    print("[配置] ✗ 未找到 pygetwindow 库 (pip install pygetwindow)。'激活窗口' 功能将不可用。")
+    print("[配置] FAIL 未找到 pygetwindow 库 (pip install pygetwindow)。'激活窗口' 功能将不可用。")
 
 # ======================================================================
 # 全局配置
@@ -58,7 +59,7 @@ except ImportError:
 try:
     import vlm_engine
 except ImportError:
-    print("[配置] ✗ 未找到 'vlm_engine.py'。AI 自然语言指令功能将不可用。")
+    print("[配置] FAIL 未找到 'vlm_engine.py'。AI 自然语言指令功能将不可用。")
     class vlm_engine:
         def find_location_by_vlm(*args, **kwargs): return None
         VLM_AVAILABLE = False
@@ -67,10 +68,10 @@ try:
     import cv2
     import numpy as np 
     OPENCV_AVAILABLE = True
-    print("[配置] ✓ OpenCV 引擎就绪 (极速找图内核已可用)")
+    print("[配置] OK OpenCV 引擎就绪 (极速找图内核已可用)")
 except ImportError:
     OPENCV_AVAILABLE = False
-    print("[配置] ✗ 未找到 OpenCV。将回退到慢速找图模式。")
+    print("[配置] FAIL 未找到 OpenCV。将回退到慢速找图模式。")
 
 # ======================================================================
 # 快捷键工具模块
@@ -141,8 +142,9 @@ class MacroSchema:
         'IF_TEXT_FOUND':  '14. IF 找到文本',
         'ELSE':           '15. ELSE',
         'END_IF':         '16. END_IF',
-        'LOOP_START':     '17. 循环开始 (Loop)',
-        'END_LOOP':       '18. 结束循环 (EndLoop)',
+        'RUN':           '17. 执行命令/脚本/文件',
+        'LOOP_START':     '18. 循环开始 (Loop)',
+        'END_LOOP':       '19. 结束循环 (EndLoop)',
     }
     ACTION_KEYS_TO_NAME = {v: k for k, v in ACTION_TRANSLATIONS.items()}
     
@@ -314,7 +316,7 @@ def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc, enhanced_mod
 # 主执行引擎
 # ======================================================================
 def execute_steps(steps, run_context=None, status_callback=None):
-    print(f"\n--- 宏执行开始 (Core V1.55.5) ---")
+    print(f"\n--- 宏执行开始 (Core V1.6.0) ---")
     perf.reset(); loop_cache.reset()
     ctx = run_context if run_context else {}
     ctx.setdefault('last_pos', (None, None))
@@ -362,6 +364,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     elif not res: print("  -> 没找到目标,宏停止"); break
                     
                     # [修复] 统一处理返回值: (x, y, text) 或 (x, y, w, h)
+                    # FIND_ 和 IF_ 找到目标后均移动鼠标，保持行为一致
+                    # (IF 体内的 CLICK 可直接复用此位置，无需再次 OCR)
                     if res:
                         # 取前两个值作为坐标
                         target_x, target_y = res[0], res[1]
@@ -404,7 +408,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     x = int(p['x']) if 'x' in p else None
                     y = int(p['y']) if 'y' in p else None
                     pyautogui.click(x=x, y=y, button=btn, clicks=clicks, interval=interval, duration=duration)
-                    if x and y: ctx['last_pos'] = (x, y)
+                    if x is not None and y is not None:
+                        ctx['last_pos'] = (x, y)
                 
                 elif act == 'MOVE_TO':
                     x, y = int(p['x']), int(p['y'])
@@ -412,7 +417,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     ctx['last_pos'] = (x, y)
                 
                 elif act == 'MOVE_OFFSET':
-                    if not ctx['last_pos'][0]: print("  [错误] 无上次坐标"); break
+                    if ctx['last_pos'][0] is None or ctx['last_pos'][1] is None: print("  [错误] 无上次坐标"); break
                     ox, oy = int(p['x_offset']), int(p['y_offset'])
                     pyautogui.move(ox, oy, duration=float(p.get('duration', 0.25)))
                     ctx['last_pos'] = (ctx['last_pos'][0]+ox, ctx['last_pos'][1]+oy)
@@ -495,7 +500,19 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     # 注意：必须更新 pc，否则会无限循环
                     pc = next_pc
                     continue
-                
+
+                elif act == 'RUN':
+                    # 执行命令/脚本/文件
+                    run_result = _handle_run(p, ctx)
+                    # 如果返回 False，表示执行失败
+                    if run_result is False:
+                        print("  [RUN] 执行失败")
+                        # 可配置：是否失败时停止
+                        if p.get('fail_stop', True):
+                            break
+                    else:
+                        print(f"  [RUN] 执行成功")
+
                 elif act == 'ELSE': 
                     next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['END_IF'])
                 
@@ -522,24 +539,24 @@ def execute_steps(steps, run_context=None, status_callback=None):
                                 loop_cache.exit()
                                 loop_cache.clear_cache(loop_id_to_exit)
                                 if status_callback:
-                                    status_callback(f"⚠️ 达到最大迭代 {top['max_iterations']} 次,强制退出")
-                                print(f"  [Loop Until] ⚠️ 达到最大迭代次数,强制退出")
+                                    status_callback(f"WARN 达到最大迭代 {top['max_iterations']} 次,强制退出")
+                                print(f"  [Loop Until] WARN 达到最大迭代次数,强制退出")
                                 next_pc = pc + 1  # 继续执行下一步
                             else:
                                 # 检查退出条件
                                 condition_met = _check_loop_condition(top, ctx)
                                 if condition_met:
-                                    # ✅ 条件满足, 退出循环
+                                    # OK 条件满足, 退出循环
                                     loop_id_to_exit = loops.pop()['id']
                                     loop_cache.exit()
                                     loop_cache.clear_cache(loop_id_to_exit)
                                     if status_callback:
-                                        status_callback(f"✓ 条件满足,循环结束 (共 {top['iteration']} 次)")
-                                    print(f"  [Loop Until] ✓✓✓ 条件满足,循环结束")
+                                        status_callback(f"OK 条件满足,循环结束 (共 {top['iteration']} 次)")
+                                    print(f"  [Loop Until] OK 条件满足,循环结束")
                                     next_pc = pc + 1  # 继续执行下一步
                                 else:
-                                    # ❌ 条件未满足, 继续循环
-                                    print(f"  [Loop Until] ✗ 未找到目标,继续循环 (第 {top['iteration']} 次)")
+                                    # FAIL 条件未满足, 继续循环
+                                    print(f"  [Loop Until] FAIL 未找到目标,继续循环 (第 {top['iteration']} 次)")
                                     
                                     # 使用可配置的检测间隔，平衡速度与准确率
                                     # 0.15s 经过实测：既不会让UI卡顿，也能及时检测到目标
@@ -558,6 +575,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
             except Exception as e:
                 print(f"  [执行异常] {e}"); import traceback; traceback.print_exc(); break
             pc = next_pc
+        
+        return pc >= len(steps)
     finally:
         loop_cache.reset()
         print(f"--- 执行结束 ---\n[统计] {perf.get_stats()}\n")
@@ -583,6 +602,7 @@ def _handle_find(act, p, ctx, in_loop):
     ss, offset = smart_screenshot(region)
     sig = f"{act}_{p.get('path', p.get('text',''))}"
 
+    # 增强模式：IF 动作和多缩放尝试（性能开销大，但更准确）
     enhanced_mode = ctx.get('enhanced_mode', False)
 
     if in_loop:
@@ -591,14 +611,14 @@ def _handle_find(act, p, ctx, in_loop):
             perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
 
     res = _do_find(is_img, p, ss, offset, final_engine, ctx)
-    
-    if not res and region and ENABLE_GLOBAL_FALLBACK and enhanced_mode:
+
+    # IF 动作不使用全局 fallback（会大幅降低性能，因为它已经重复搜索了）
+    # FIND_TEXT/FIND_IMAGE 才使用 fallback
+    if not res and region and ENABLE_GLOBAL_FALLBACK and enhanced_mode and not act.startswith('IF_'):
         print("  [缓存失效] 全局搜索...")
         ss, offset = smart_screenshot(None)
         res = _do_find(is_img, p, ss, offset, final_engine, ctx)
         if res:
-            # _do_find 保证返回 (x, y)，估算点击区域
-            w, h = (0, 0) 
             if len(res) >= 2:
                 p['cache_box'] = [res[0]-20, res[1]-10, res[0]+20, res[1]+10]
 
@@ -606,8 +626,8 @@ def _handle_find(act, p, ctx, in_loop):
         pos = (res[0], res[1])
         if in_loop: loop_cache.set(sig, pos)
         ctx['last_pos'] = pos
-        return res # 返回完整结果
-    
+        return res
+
     perf.record_miss(not is_img)
     return None
 
@@ -675,7 +695,7 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
                 ctx['clipboard_var'] = final_text
                 try:
                     pyperclip.copy(final_text)
-                    print(f"  [剪贴板] ✓ 已复制")
+                    print(f"  [剪贴板] OK 已复制")
                 except Exception as e:
                     print(f"  [剪贴板] 失败: {e}")
             
@@ -749,11 +769,21 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
         if mode == 'until_image':
             loop_data['condition_image'] = p.get('condition_image', '')
             loop_data['confidence'] = float(p.get('confidence', 0.8))
-            print(f"  [Loop Until Image] 目标: {loop_data['condition_image']}")
+            # [优化] 保存搜索区域，加速条件检测
+            if 'cache_box' in p:
+                loop_data['cache_box'] = p['cache_box']
+                print(f"  [Loop Until Image] 目标: {loop_data['condition_image']} (区域: {p['cache_box']})")
+            else:
+                print(f"  [Loop Until Image] 目标: {loop_data['condition_image']} (全屏)")
         elif mode == 'until_text':
             loop_data['condition_text'] = p.get('condition_text', '')
             loop_data['lang'] = p.get('lang', 'eng')
-            print(f"  [Loop Until Text] 目标: {loop_data['condition_text']}")
+            # [优化] 保存搜索区域，加速条件检测
+            if 'cache_box' in p:
+                loop_data['cache_box'] = p['cache_box']
+                print(f"  [Loop Until Text] 目标: {loop_data['condition_text']} (区域: {p['cache_box']})")
+            else:
+                print(f"  [Loop Until Text] 目标: {loop_data['condition_text']} (全屏)")
         
         loops.append(loop_data)
         loop_cache.enter(loop_id)
@@ -785,6 +815,16 @@ def _check_loop_condition(loop_data, ctx):
     """
     mode = loop_data.get('mode', 'fixed')
     
+    # [优化] 统一构建截图区域（支持 cache_box 缩小截图范围）
+    def _build_region(ld):
+        cb = ld.get('cache_box')
+        if cb and isinstance(cb, list) and len(cb) >= 4:
+            w_raw, h_raw = cb[2] - cb[0], cb[3] - cb[1]
+            if w_raw > 0 and h_raw > 0:
+                pad = CACHE_BOX_PADDING
+                return (max(0, cb[0]-pad), max(0, cb[1]-pad), w_raw+pad*2, h_raw+pad*2)
+        return None
+
     if mode == 'until_image':
         path = loop_data.get('condition_image', '')
         conf = loop_data.get('confidence', 0.8)
@@ -794,20 +834,19 @@ def _check_loop_condition(loop_data, ctx):
             return False
         
         try:
-            ss = ImageGrab.grab()
+            region = _build_region(loop_data)
+            ss, offset = smart_screenshot(region)
             enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
-            res_val = find_image_cv2(path, conf, ss, offset=(0, 0), enhanced_mode=enhanced_mode)
+            res_val = find_image_cv2(path, conf, ss, offset=offset, enhanced_mode=enhanced_mode)
             found = res_val is not None
             if found:
-                print(f"  [Loop Until] ✓✓✓ 找到目标图像: {os.path.basename(path)}")
-            
+                print(f"  [Loop Until] OK 找到目标图像: {os.path.basename(path)}")
             return found
         except Exception as e:
             print(f"  [Loop Until] 图像检测错误: {e}")
             return False
     
     elif mode == 'until_text':
-        # 检查文本是否找到
         text = loop_data.get('condition_text', '')
         lang = loop_data.get('lang', 'eng')
         
@@ -816,24 +855,249 @@ def _check_loop_condition(loop_data, ctx):
             return False
         
         try:
-            ss = ImageGrab.grab()
-            # 兼容新的返回格式
+            region = _build_region(loop_data)
+            ss, offset = smart_screenshot(region)
             enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
-            res = ocr_engine.find_text_location(text, lang, False, ss, (0, 0), 'auto', enhanced_mode)
+            res = ocr_engine.find_text_location(text, lang, False, ss, offset, 'auto', enhanced_mode)
             
             if res:
-                # [优化] 打印识别到的具体文本
                 found_txt = text
                 if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], str):
                     found_txt = res[1]
-                print(f"  [Loop Until] ✓✓✓ 找到目标文本: '{found_txt}'")
+                found_txt = found_txt.encode('gbk', errors='replace').decode('gbk')
+                print(f"  [Loop Until] OK 找到目标文本: '{found_txt}'")
                 return True
-            
             return False
         except Exception as e:
-            print(f"  [Loop Until] 文本检测错误: {e}")
+            error_msg = str(e).encode('gbk', errors='replace').decode('gbk')
+            print(f"  [Loop Until] 文本检测错误: {error_msg}")
             return False
     
     return False
 
 core_engine_version = f"1.6.2 (Core) / OpenCV: {OPENCV_AVAILABLE}"
+
+# ======================================================================
+# RUN 处理函数：执行命令/脚本/文件
+# ======================================================================
+def _handle_run(p, ctx):
+    """执行命令、脚本或写入文件
+    
+    参数:
+        run_type: 类型 ("command" | "script" | "file")
+        command: 命令 (run_type=command)
+        script_path: 脚本路径 (run_type=script)
+        interpreter: 解释器 (run_type=script, 默认 python)
+        file_path: 文件路径 (run_type=file)
+        content: 文件内容 (run_type=file)
+        args: 命令/脚本参数
+        timeout: 超时秒数 (默认 30)
+        cwd: 工作目录
+        append: 追加模式 (run_type=file)
+        save_output: 保存输出到剪贴板
+    
+    返回:
+        True: 成功
+        False: 失败
+    """
+    run_type = p.get('run_type', 'command')
+    
+    # === 文件写入模式 ===
+    if run_type == 'file':
+        file_path = p.get('file_path', '')
+        if not file_path:
+            print("  [RUN] 错误: 未指定文件路径")
+            return False
+        
+        content = p.get('content', '')
+        
+        # 支持占位符替换
+        content = content.replace('{CLIPBOARD}', ctx.get('clipboard_var', ''))
+        content = content.replace('{DATETIME}', time.strftime('%Y-%m-%d %H:%M:%S'))
+        
+        try:
+            mode = 'a' if p.get('append', False) else 'w'
+            encoding = p.get('encoding', 'utf-8')
+            
+            # 检查目录是否存在
+            dir_path = os.path.dirname(file_path)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
+                print(f"  [RUN] 已创建目录: {dir_path}")
+            
+            with open(file_path, mode, encoding=encoding) as f:
+                f.write(content)
+            
+            print(f"  [RUN] 已写入文件: {file_path}")
+            return True
+            
+        except Exception as e:
+            print(f"  [RUN] 写入文件失败: {e}")
+            return False
+    
+    # === 命令执行模式 ===
+    elif run_type == 'command':
+        command = p.get('command', '')
+        args = p.get('args', '')
+        timeout = int(p.get('timeout', 30))
+        cwd = p.get('cwd', None)
+        save_output = p.get('save_output', False)
+        
+        if not command:
+            print("  [RUN] 错误: 未指定命令")
+            return False
+        
+        full_cmd = f"{command} {args}" if args else command
+        
+        try:
+            result = subprocess.run(
+                full_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd if cwd else None
+            )
+            
+            output = result.stdout.strip() if result.stdout else result.stderr.strip()
+            
+            if result.returncode == 0:
+                print(f"  [RUN] 命令执行成功")
+                if output:
+                    print(f"        输出: {output[:200]}")
+                if save_output and output:
+                    ctx['clipboard_var'] = output
+                    try:
+                        pyperclip.copy(output)
+                        print(f"        已保存到剪贴板")
+                    except Exception:
+                        pass
+                return True
+            else:
+                print(f"  [RUN] 命令执行失败 (退出码: {result.returncode})")
+                if output:
+                    print(f"        错误: {output[:200]}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print(f"  [RUN] 命令执行超时 ({timeout}秒)")
+            return False
+        except Exception as e:
+            print(f"  [RUN] 命令执行错误: {e}")
+            return False
+    
+    # === 脚本执行模式 ===
+    elif run_type == 'script':
+        script_path = p.get('script_path', '')
+        interpreter = p.get('interpreter', 'python')
+        args = p.get('args', '')
+        timeout = int(p.get('timeout', 30))
+        cwd = p.get('cwd', None)
+        save_output = p.get('save_output', False)
+        
+        if not script_path:
+            print("  [RUN] 错误: 未指定脚本路径")
+            return False
+        
+        # 检查脚本文件是否存在
+        if not os.path.exists(script_path):
+            print(f"  [RUN] 错误: 脚本文件不存在: {script_path}")
+            return False
+        
+        # 解释器映射
+        INTERPRETERS = {
+            'python': 'python',
+            'python3': 'python',
+            'node': 'node',
+            'powershell': 'powershell',
+            'cmd': 'cmd',
+            'bat': 'cmd',
+        }
+        cmd = INTERPRETERS.get(interpreter, interpreter)
+        
+        full_cmd = f'{cmd} "{script_path}" {args}' if args else f'{cmd} "{script_path}"'
+        
+        try:
+            result = subprocess.run(
+                full_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd if cwd else None
+            )
+            
+            output = result.stdout.strip() if result.stdout else result.stderr.strip()
+            
+            if result.returncode == 0:
+                print(f"  [RUN] 脚本执行成功")
+                if output:
+                    print(f"        输出: {output[:200]}")
+                if save_output and output:
+                    ctx['clipboard_var'] = output
+                    try:
+                        pyperclip.copy(output)
+                        print(f"        已保存到剪贴板")
+                    except Exception:
+                        pass
+                return True
+            else:
+                print(f"  [RUN] 脚本执行失败 (退出码: {result.returncode})")
+                if output:
+                    print(f"        错误: {output[:200]}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print(f"  [RUN] 脚本执行超时 ({timeout}秒)")
+            return False
+        except Exception as e:
+            print(f"  [RUN] 脚本执行错误: {e}")
+            return False
+    
+    # 未知类型
+    else:
+        print(f"  [RUN] 错误: 未知的 run_type: {run_type}")
+        return False
+
+
+# ======================================================================
+# 宏数据校验（从 MacroAssistant.py 迁移，完成 1.7Beta 中声明的迁移）
+# ======================================================================
+def validate_macro_data(data):
+    """
+    验证宏数据结构是否有效
+
+    Args:
+        data: 从 JSON 加载的数据
+
+    Returns:
+        bool: 数据是否有效
+    """
+    # 必须是列表
+    if not isinstance(data, list):
+        print("[验证失败] 根对象不是列表")
+        return False
+
+    # 验证每个步骤的基本结构
+    for i, step in enumerate(data):
+        # 必须是字典
+        if not isinstance(step, dict):
+            print(f"[验证失败] 步骤 {i+1} 不是字典对象")
+            return False
+
+        # 必须包含 'action' 字段
+        if 'action' not in step:
+            print(f"[验证失败] 步骤 {i+1} 缺少 'action' 字段")
+            return False
+
+        # 必须包含 'params' 字段且为字典
+        if 'params' not in step or not isinstance(step['params'], dict):
+            print(f"[验证失败] 步骤 {i+1} 缺少 'params' 字段或格式错误")
+            return False
+
+        # 验证 action 是否是已知的动作类型（仅警告，不阻止加载）
+        if step['action'] not in MacroSchema.ACTION_TRANSLATIONS:
+            print(f"[警告] 步骤 {i+1} 包含未知的动作类型: {step['action']}")
+            # 不返回 False，允许加载未知动作类型（向前兼容）
+
+    return True

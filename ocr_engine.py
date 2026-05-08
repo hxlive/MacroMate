@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # ocr_engine.py
 # 描述:自动化宏的 OCR 功能引擎
-# 版本:1.5.6
-# 变更:(终极修复) 返回完整识别文本,支持剪贴板功能
+# 版本:1.5.8
+# 变更:增强模式优化，支持 OCR 阈值调整，优化多引擎选择策略
 
 from PIL import Image, ImageGrab
 import re
@@ -244,7 +244,7 @@ def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_p
             if target_norm in w['text']:
                 b = w['box']
                 cx, cy = offset[0]+b['x']+b['width']//2, offset[1]+b['y']+b['height']//2
-                if debug: print(f"  [WinOCR✓] ({cx}, {cy})")
+                if debug: print(f"  [WinOCR OK] ({cx}, {cy})")
                 return ((cx, cy), full_text)
         
         # 多词合并匹配
@@ -258,7 +258,7 @@ def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_p
                 if target_norm == merged:
                     cx = offset[0] + sum(b['x']+b['width']//2 for b in b_list)//len(b_list)
                     cy = offset[1] + sum(b['y']+b['height']//2 for b in b_list)//len(b_list)
-                    if debug: print(f"  [WinOCR✓] 合并 ({cx}, {cy})")
+                    if debug: print(f"  [WinOCR OK] 合并 ({cx}, {cy})")
                     return ((cx, cy), full_text)
         return None
     except: return None
@@ -321,7 +321,7 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset, enha
             if target_norm in w['text']:
                 b = w['box']
                 cx, cy = offset[0] + ((b[0]+b[2])//2)//scale, offset[1] + ((b[1]+b[3])//2)//scale
-                if debug: print(f"  [RapidOCR✓] ({cx}, {cy}) @ {w['score']:.2f}")
+                if debug: print(f"  [RapidOCR OK] ({cx}, {cy}) @ {w['score']:.2f}")
                 return ((cx, cy), full_text)
         
         # 多词合并匹配
@@ -335,7 +335,7 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset, enha
                 if target_norm == merged:
                     cx = offset[0] + (sum((b[0]+b[2])//2 for b in b_list)//len(b_list)) // scale
                     cy = offset[1] + (sum((b[1]+b[3])//2 for b in b_list)//len(b_list)) // scale
-                    if debug: print(f"  [RapidOCR✓] 合并 ({cx}, {cy})")
+                    if debug: print(f"  [RapidOCR OK] 合并 ({cx}, {cy})")
                     return ((cx, cy), full_text)
         return None
     except Exception as e:
@@ -391,7 +391,7 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset, enhan
                 if target_norm in w['text']:
                     b = w['box'] 
                     cx, cy = offset[0]+(b[0]+b[2])//2, offset[1]+(b[1]+b[3])//2
-                    if debug: print(f"  [Tesseract✓] (PSM {psm}) ({cx}, {cy})")
+                    if debug: print(f"  [Tesseract OK] (PSM {psm}) ({cx}, {cy})")
                     return ((cx, cy), full_text)
             
             # 多词合并匹配
@@ -405,7 +405,7 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset, enhan
                     if target_norm == merged:
                         cx = offset[0] + sum((b[0]+b[2])//2 for b in b_list)//len(b_list)
                         cy = offset[1] + sum((b[1]+b[3])//2 for b in b_list)//len(b_list)
-                        if debug: print(f"  [Tesseract✓] (PSM {psm}) 合并 ({cx}, {cy})")
+                        if debug: print(f"  [Tesseract OK] (PSM {psm}) 合并 ({cx}, {cy})")
                         return ((cx, cy), full_text)
                         
         return None
