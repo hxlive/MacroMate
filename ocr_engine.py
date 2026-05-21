@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # ocr_engine.py
 # 描述:自动化宏的 OCR 功能引擎
-# 版本:1.5.8
-# 变更:增强模式优化，支持 OCR 阈值调整，优化多引擎选择策略
+# 版本:1.7.0
+# 变更:(终极修复) 返回完整识别文本,支持剪贴板功能
 
 from PIL import Image, ImageGrab
 import re
@@ -103,7 +103,8 @@ def get_tesseract_cmd():
                 find_cmd = 'where' if os.name == 'nt' else 'which'
                 res = subprocess.run([find_cmd, 'tesseract'], capture_output=True, text=True, encoding='utf-8', errors='ignore', creationflags=cflags)
                 if res.returncode == 0: _TESSERACT_CMD = res.stdout.strip().split('\n')[0]
-            except: pass
+            except Exception:
+                pass
 
         if _TESSERACT_CMD:
             try:
@@ -121,6 +122,8 @@ LANG_MAP = {
     'rapidocr': {'eng': 'en', 'chi_sim': 'ch'},
     'tesseract': {'eng': 'eng', 'chi_sim': 'chi_sim'}
 }
+
+MAX_MERGE_WORDS = 20
 
 class OCRPerformanceStats:
     def __init__(self): self.reset()
@@ -158,12 +161,15 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
     if screenshot_pil is None: screenshot_pil = ImageGrab.grab(); offset = (0, 0)
     
     img_bgr_cache = None 
-    full_text_cache = {}  # 缓存每个引擎的完整文本
-    
+
     def get_img_bgr():
         nonlocal img_bgr_cache
-        if img_bgr_cache is None: 
-            img_bgr_cache = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2BGR)
+        if img_bgr_cache is None:
+            try:
+                img_bgr_cache = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                print(f"  [OCR] 截图转换失败: {e}")
+                return None
         return img_bgr_cache
 
     if engine == 'auto':
@@ -179,9 +185,10 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
         
         # 尝试 RapidOCR
         rapid_inst = get_rapid_ocr_engine()
-        if rapid_inst and lang in LANG_MAP['rapidocr']:
+        img_bgr = get_img_bgr()
+        if rapid_inst and img_bgr is not None and lang in LANG_MAP['rapidocr']:
             t0 = time.time()
-            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, get_img_bgr(), offset, enhanced_mode)
+            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, img_bgr, offset, enhanced_mode)
             ocr_stats.record('rapidocr', result is not None, time.time() - t0)
             if result: return result
 
@@ -194,9 +201,10 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
 
     elif engine == 'rapidocr':
         rapid_inst = get_rapid_ocr_engine()
-        if rapid_inst and lang in LANG_MAP['rapidocr']:
+        img_bgr = get_img_bgr()
+        if rapid_inst and img_bgr is not None and lang in LANG_MAP['rapidocr']:
             t0 = time.time()
-            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, get_img_bgr(), offset, enhanced_mode)
+            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, img_bgr, offset, enhanced_mode)
             ocr_stats.record('rapidocr', result is not None, time.time() - t0)
             if result: return result
 
@@ -252,7 +260,7 @@ def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_p
             merged = words[i]['text']
             if not target_norm.startswith(merged): continue
             b_list = [words[i]['box']]
-            for j in range(i+1, min(i+5, len(words))):
+            for j in range(i+1, min(i+MAX_MERGE_WORDS, len(words))):
                 merged += words[j]['text']
                 b_list.append(words[j]['box'])
                 if target_norm == merged:
@@ -261,7 +269,9 @@ def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_p
                     if debug: print(f"  [WinOCR OK] 合并 ({cx}, {cy})")
                     return ((cx, cy), full_text)
         return None
-    except: return None
+    except Exception as e:
+        print(f"  [WinOCR] 异常: {e}")
+        return None
 
 def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset, enhanced_mode=False):
     try:
@@ -329,7 +339,7 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset, enha
             merged = words[i]['text']
             if not target_norm.startswith(merged): continue
             b_list = [words[i]['box']]
-            for j in range(i+1, min(i+5, len(words))):
+            for j in range(i+1, min(i+MAX_MERGE_WORDS, len(words))):
                 merged += words[j]['text']
                 b_list.append(words[j]['box'])
                 if target_norm == merged:
@@ -374,7 +384,12 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset, enhan
             all_texts = []
             
             for i in range(len(data['text'])):
-                if int(data['conf'][i]) > 30 and data['text'][i].strip():
+                try:
+                    confidence = float(data['conf'][i])
+                except (ValueError, TypeError):
+                    confidence = -1
+
+                if confidence > 30 and data['text'][i].strip():
                     words.append({
                         'text': re.sub(r'\s+','',data['text'][i]).lower(),
                         'box': [data['left'][i]//s, data['top'][i]//s, (data['left'][i]+data['width'][i])//s, (data['top'][i]+data['height'][i])//s],
@@ -399,7 +414,7 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset, enhan
                 merged = words[i]['text']
                 if not target_norm.startswith(merged): continue
                 b_list = [words[i]['box']]
-                for j in range(i+1, min(i+5, len(words))):
+                for j in range(i+1, min(i+MAX_MERGE_WORDS, len(words))):
                     merged += words[j]['text']
                     b_list.append(words[j]['box'])
                     if target_norm == merged:
@@ -434,4 +449,4 @@ def get_available_engines():
         
     return engines
 
-ocr_engine_version = "1.5.6"
+ocr_engine_version = "1.7.0"

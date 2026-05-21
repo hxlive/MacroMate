@@ -1,20 +1,16 @@
-# -*- coding: utf-8 -*-
 # gui_utils.py
-# 描述：GUI 辅助工具库 (重构版 - 样式完美还原)
-# 版本：1.4.0
+# 描述：GUI 组件工厂与界面逻辑处理 (重构版)
+# 版本：1.7.0
 
 import sys
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import pyautogui
+from tkinter import ttk, filedialog
 from PIL import Image, ImageTk
 import os
-import time
-import base64
 
 # 引入核心库中的工具用于处理快捷键显示
 try:
-    from core_engine import HotkeyUtils
+    from core_engine import HotkeyUtils, MacroSchema
 except ImportError:
     # Fallback
     class HotkeyUtils:
@@ -33,40 +29,9 @@ def parse_region_string(region_str):
     except (ValueError, TypeError, IndexError, AttributeError):
         return None
 
-# =================================================================
-# 2. 鼠标位置追踪器 (MouseTracker)
-# =================================================================
-class MouseTracker:
-    def __init__(self, root, tk_var):
-        self.root = root
-        self.var = tk_var
-        self.job = None
-        self.is_running = False
-
-    def start(self):
-        if not self.is_running:
-            self.is_running = True
-            self._update()
-
-    def stop(self):
-        self.is_running = False
-        if self.job:
-            try: self.root.after_cancel(self.job)
-            except: pass
-            self.job = None
-            self.var.set("")
-
-    def _update(self):
-        if not self.is_running: return
-        try:
-            x, y = pyautogui.position()
-            self.var.set(f"X: {x}, Y: {y}")
-        except Exception as e:
-            self.var.set("未知")
-        self.job = self.root.after(100, self._update)
 
 # =================================================================
-# 3. 自动换行标签 (AutoWrapLabel)
+# 2. 自动换行标签 (AutoWrapLabel)
 # =================================================================
 class AutoWrapLabel(ttk.Label):
     def __init__(self, master, **kwargs):
@@ -80,559 +45,7 @@ class AutoWrapLabel(ttk.Label):
         if width > 0:
             self.configure(wraplength=width)
 
-# =================================================================
-# 4. 区域选择器 (RegionSelector)
-# =================================================================
-class RegionSelector:
-    def __init__(self, master):
-        self.master = master
-        self.selection = None
-        self.is_selecting = False
-        self.start_x = 0; self.start_y = 0; self.cur_x = 0; self.cur_y = 0
 
-        self.top = tk.Toplevel(self.master)
-        self.top.attributes('-fullscreen', True)
-        self.top.attributes('-alpha', 0.3)
-        self.top.attributes('-topmost', True)
-        self.top.configure(cursor="cross")
-        self.top.overrideredirect(True)
-
-        self.canvas = tk.Canvas(self.top, bg="black", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-
-        self._bind_events()
-
-    def _bind_events(self):
-        self.top.bind("<ButtonPress-1>", self._on_press)
-        self.top.bind("<B1-Motion>", self._on_drag)
-        self.top.bind("<ButtonRelease-1>", self._on_release)
-        self.top.bind("<Escape>", self._on_cancel)
-        self.top.bind("<Return>", self._on_confirm)  # [修复 BUG-5] 恢复 Enter 键确认
-
-    def _on_confirm(self, event=None):
-        """Enter 键确认当前选区"""
-        if self.cur_x != 0 or self.cur_y != 0:
-            x1, y1 = min(self.start_x, self.cur_x), min(self.start_y, self.cur_y)
-            x2, y2 = max(self.start_x, self.cur_x), max(self.start_y, self.cur_y)
-            if abs(x2 - x1) > 5 and abs(y2 - y1) > 5:
-                self.selection = (x1, y1, x2, y2)
-        self.top.destroy()
-
-    def _on_press(self, event):
-        self.is_selecting = True
-        self.start_x, self.start_y = event.x, event.y
-        self.rect = self.canvas.create_rectangle(
-            self.start_x, self.start_y, self.start_x, self.start_y,
-            outline="red", width=2, fill="white", stipple="gray50"
-        )
-
-    def _on_drag(self, event):
-        if self.is_selecting:
-            self.cur_x, self.cur_y = event.x, event.y
-            self.canvas.coords(self.rect, self.start_x, self.start_y, self.cur_x, self.cur_y)
-
-    def _on_release(self, event):
-        if self.is_selecting:
-            self.is_selecting = False
-            self.cur_x, self.cur_y = event.x, event.y
-            x1, y1 = min(self.start_x, self.cur_x), min(self.start_y, self.cur_y)
-            x2, y2 = max(self.start_x, self.cur_x), max(self.start_y, self.cur_y)
-            if abs(x2 - x1) > 5 and abs(y2 - y1) > 5:
-                self.selection = (x1, y1, x2, y2)
-            self.top.destroy()
-
-    def _on_cancel(self, event=None):
-        self.is_selecting = False
-        self.top.destroy()
-
-    def get_region(self):
-        self.master.wait_window(self.top)
-        return self.selection
-
-# =================================================================
-# 5. 快捷键输入框 (HotkeyEntry)
-# =================================================================
-class HotkeyEntry(ttk.Entry):
-    def __init__(self, master, hotkey_var, **kwargs):
-        # [NEW-2] 修复：不要绑定 hotkey_var 到 ttk.Entry 上，直接使用 _display_text
-        super().__init__(master, **kwargs)
-        self.hotkey_var = hotkey_var
-        self.bind("<FocusIn>", self._on_focus_in)
-        self.bind("<FocusOut>", self._on_focus_out)
-        self.bind("<Key>", self._on_key)
-        self._placeholder = "点击此处，按下快捷键..."
-        self._is_recording = False
-        self._pressed_keys = set()
-        self._display_text = tk.StringVar()
-        
-        # 初始状态配置
-        current = self.hotkey_var.get()
-        if current:
-            self._display_text.set(HotkeyUtils.format_hotkey_display(current))
-            self.config(textvariable=self._display_text, bootstyle="default")
-        else:
-            self._display_text.set(self._placeholder)
-            # [NEW-1] 修复：使用 bootstyle="secondary" (灰字) 而不是原生的 foreground 属性
-            self.config(textvariable=self._display_text, bootstyle="secondary")
-
-    def _on_focus_in(self, event):
-        self._is_recording = True
-        self._pressed_keys.clear()
-        self._display_text.set("按下快捷键组合...")
-        # 录制时高亮为 info 色（蓝）
-        self.config(bootstyle="info")
-
-    def _on_focus_out(self, event):
-        self._is_recording = False
-        self._pressed_keys.clear()
-        current = self.hotkey_var.get()
-        if current:
-            display = HotkeyUtils.format_hotkey_display(current)
-            self._display_text.set(display)
-            self.config(bootstyle="default")
-        else:
-            self._display_text.set(self._placeholder)
-            self.config(bootstyle="secondary")
-
-    def _on_key(self, event):
-        if not self._is_recording:
-            return
-
-        key = event.keysym.lower()
-        if key in ('shift_l', 'shift_r'): key = 'shift'
-        elif key in ('control_l', 'control_r'): key = 'ctrl'
-        elif key in ('alt_l', 'alt_r', 'alt_gr'): key = 'alt'
-        elif key in ('command', 'command_l', 'command_r', 'win', 'win_l', 'win_r'): key = 'cmd'
-
-        if key not in ('shift', 'ctrl', 'alt', 'cmd'):
-            if len(key) == 1 or key in ('f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12', 'space', 'return', 'tab', 'backspace', 'delete', 'insert', 'home', 'end', 'pageup', 'pagedown', 'up', 'down', 'left', 'right'):
-                self._pressed_keys.add(key)
-
-        modifiers = []
-        if event.state & 0x0001: modifiers.append('shift')
-        if event.state & 0x0004: modifiers.append('ctrl')
-        if event.state & 0x20000: modifiers.append('alt')
-        if event.state & 0x0008: modifiers.append('cmd')
-
-        for mod in modifiers:
-            self._pressed_keys.add(mod)
-
-        sorted_keys = sorted(list(self._pressed_keys), key=lambda k: (k not in ['ctrl', 'alt', 'shift', 'cmd'], k))
-
-        if sorted_keys:
-            hotkey_str = '+'.join(sorted_keys)
-            self.hotkey_var.set(hotkey_str)
-            display_str = HotkeyUtils.format_hotkey_display(hotkey_str)
-            self._display_text.set(display_str)
-
-        return 'break'
-
-# =================================================================
-# 6. 快捷键设置对话框 (HotkeySettingsDialog)
-# =================================================================
-class HotkeySettingsDialog:
-    # [修复 BUG-4] 恢复快捷键格式校验；默认值修正为 ctrl+f10/ctrl+f11
-    def __init__(self, parent, run_hotkey, stop_hotkey,
-                 default_run='ctrl+f10', default_stop='ctrl+f11'):
-        self.parent = parent
-        self.default_run = default_run
-        self.default_stop = default_stop
-        self.result = None
-
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("快捷键设置")
-        self.dialog.geometry("450x480")
-        self.dialog.resizable(False, False)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-
-        self.dialog.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - self.dialog.winfo_width()) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - self.dialog.winfo_height()) // 2
-        self.dialog.geometry(f"+{x}+{y}")
-
-        self._create_ui(run_hotkey, stop_hotkey)
-        self.dialog.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _create_ui(self, run_hotkey, stop_hotkey):
-        main_frame = ttk.Frame(self.dialog, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(main_frame, text="⌨️ 自定义快捷键",
-                  font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(0, 15))
-
-        self.run_var = tk.StringVar(value=run_hotkey)
-        run_frame = ttk.Labelframe(main_frame, text="运行/继续 快捷键", padding=15)
-        run_frame.pack(fill=tk.X, pady=(0, 15))
-        run_inner = ttk.Frame(run_frame)
-        run_inner.pack(fill=tk.X)
-        run_inner.columnconfigure(0, weight=1)
-        self.run_entry = HotkeyEntry(run_inner, self.run_var, width=25)
-        self.run_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10), ipady=5)
-        ttk.Button(run_inner, text="🎯 录制", command=self.run_entry.focus_set,
-                   bootstyle="info", width=12).grid(row=0, column=1, ipady=3)
-
-        self.stop_var = tk.StringVar(value=stop_hotkey)
-        stop_frame = ttk.Labelframe(main_frame, text="停止宏快捷键", padding=15)
-        stop_frame.pack(fill=tk.X, pady=(0, 15))
-        stop_inner = ttk.Frame(stop_frame)
-        stop_inner.pack(fill=tk.X)
-        stop_inner.columnconfigure(0, weight=1)
-        self.stop_entry = HotkeyEntry(stop_inner, self.stop_var, width=25)
-        self.stop_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10), ipady=5)
-        ttk.Button(stop_inner, text="🎯 录制", command=self.stop_entry.focus_set,
-                   bootstyle="info", width=12).grid(row=0, column=1, ipady=3)
-
-        ttk.Label(main_frame, text="💡 支持: Ctrl, Alt, Shift, F1-F12, A-Z, 0-9等",
-                  font=("Microsoft YaHei UI", 9), foreground="#666").pack(pady=(20, 20))
-
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
-        btn_frame.columnconfigure(2, weight=1)
-        ttk.Button(btn_frame, text="✕ 取消", command=self._on_close,
-                   bootstyle="secondary", padding=(10, 10)).grid(row=0, column=0, sticky="ew", padx=(5, 0))
-        ttk.Button(btn_frame, text="🔄 恢复默认", command=self._reset_default,
-                   bootstyle="warning-outline", padding=(10, 10)).grid(row=0, column=1, sticky="ew", padx=5)
-        ttk.Button(btn_frame, text="✓ 保存", command=self._on_save,
-                   bootstyle="success", padding=(10, 10)).grid(row=0, column=2, sticky="ew", padx=(0, 5))
-
-    def _reset_default(self):
-        self.run_var.set(self.default_run)
-        self.stop_var.set(self.default_stop)
-
-    def _on_save(self):
-        run_hk = self.run_var.get().strip().lower()
-        stop_hk = self.stop_var.get().strip().lower()
-        if not run_hk or not stop_hk:
-            messagebox.showerror("错误", "快捷键不能为空", parent=self.dialog)
-            return
-        if run_hk == stop_hk:
-            messagebox.showerror("错误", "运行和停止快捷键不能相同", parent=self.dialog)
-            return
-        if not self._validate_hotkey(run_hk):
-            messagebox.showerror("错误", f"运行快捷键格式无效: {run_hk}", parent=self.dialog)
-            return
-        if not self._validate_hotkey(stop_hk):
-            messagebox.showerror("错误", f"停止快捷键格式无效: {stop_hk}", parent=self.dialog)
-            return
-        self.result = (run_hk, stop_hk)
-        self.dialog.destroy()
-
-    def _validate_hotkey(self, hotkey):
-        parts = hotkey.split('+')
-        if not parts:
-            return False
-        if len(parts) == 1:
-            p = parts[0]
-            if p.startswith('f') and p[1:].isdigit():
-                return int(p[1:]) in range(1, 13)
-            return False
-        modifiers = {'ctrl', 'alt', 'shift', 'cmd'}
-        valid_keys = set('abcdefghijklmnopqrstuvwxyz0123456789')
-        valid_keys.update([f'f{i}' for i in range(1, 13)])
-        valid_keys.update(['space', 'enter', 'tab', 'esc', 'backspace', 'delete'])
-        for i, part in enumerate(parts):
-            part = part.strip()
-            if i < len(parts) - 1:
-                if part not in modifiers:
-                    return False
-            else:
-                if part not in valid_keys:
-                    return False
-        return True
-
-    def _on_close(self):
-        self.dialog.destroy()
-
-# =================================================================
-# 7. VLM 设置对话框 (VLMSettingsDialog)
-# =================================================================
-class VLMSettingsDialog:
-    # [修复 BUG-3] 恢复完整功能：load_config、测试连接、timeout 设置
-    def __init__(self, parent):
-        self.result = None
-        try:
-            import vlm_engine
-            self.current_config = vlm_engine.load_config()
-            self.providers = vlm_engine.get_providers()
-        except Exception:
-            self.current_config = {'provider': 'openai', 'api_key': '', 'model': '', 'timeout': 30, 'base_url': ''}
-            self.providers = {}
-        self.font_ui = ("Microsoft YaHei UI", 10)
-
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("🤖 AI 配置设置")
-        self.dialog.geometry("520x660")
-        self.dialog.resizable(False, False)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-        self.dialog.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - self.dialog.winfo_width()) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - self.dialog.winfo_height()) // 2
-        self.dialog.geometry(f"+{x}+{y}")
-
-        self._create_ui()
-
-    def _create_ui(self):
-        main_frame = ttk.Frame(self.dialog, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(main_frame, text="🤖 AI 大模型配置",
-                  font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(0, 15))
-
-        # 提供商
-        provider_frame = ttk.Labelframe(main_frame, text="AI 提供商", padding=10)
-        provider_frame.pack(fill=tk.X, pady=(0, 10))
-        self.provider_var = tk.StringVar(value=self.current_config.get('provider', 'openai'))
-        provider_names = [f"{v['name']} ({k})" for k, v in self.providers.items()] if self.providers \
-            else ['openai', 'anthropic', 'deepseek', 'zhipu', 'qwen']
-        self.provider_combo = ttk.Combobox(provider_frame, values=provider_names,
-                                            state="readonly", textvariable=self.provider_var,
-                                            font=self.font_ui)
-        self.provider_combo.pack(fill=tk.X)
-        self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
-
-        # API Key
-        key_frame = ttk.Labelframe(main_frame, text="API Key", padding=10)
-        key_frame.pack(fill=tk.X, pady=(0, 10))
-        self.api_key_var = tk.StringVar(value=self.current_config.get('api_key', ''))
-        key_entry = ttk.Entry(key_frame, textvariable=self.api_key_var,
-                              font=self.font_ui, show="*")
-        key_entry.pack(fill=tk.X)
-        self.show_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(key_frame, text="显示 API Key", variable=self.show_key_var,
-                        command=lambda: key_entry.config(
-                            show="" if self.show_key_var.get() else "*")).pack(anchor="w", pady=(5, 0))
-
-        # 模型
-        model_frame = ttk.Labelframe(main_frame, text="模型 (可选)", padding=10)
-        model_frame.pack(fill=tk.X, pady=(0, 10))
-        self.model_var = tk.StringVar(value=self.current_config.get('model', ''))
-        ttk.Entry(model_frame, textvariable=self.model_var, font=self.font_ui).pack(fill=tk.X)
-        ttk.Label(model_frame, text="留空则使用默认值",
-                  font=("Microsoft YaHei UI", 8), foreground="gray").pack(anchor="w")
-
-        # 超时
-        timeout_frame = ttk.Labelframe(main_frame, text="超时时间 (秒)", padding=10)
-        timeout_frame.pack(fill=tk.X, pady=(0, 10))
-        self.timeout_var = tk.IntVar(value=self.current_config.get('timeout', 30))
-        ttk.Spinbox(timeout_frame, from_=10, to=120,
-                    textvariable=self.timeout_var, font=self.font_ui).pack(fill=tk.X)
-
-        # 按钮
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(15, 0))
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
-        btn_frame.columnconfigure(2, weight=1)
-        ttk.Button(btn_frame, text="取消", command=self.dialog.destroy,
-                   bootstyle="secondary", padding=(10, 8)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        ttk.Button(btn_frame, text="测试连接", command=self._test_connection,
-                   bootstyle="info", padding=(10, 8)).grid(row=0, column=1, sticky="ew", padx=3)
-        ttk.Button(btn_frame, text="保存", command=self._save,
-                   bootstyle="primary", padding=(10, 8)).grid(row=0, column=2, sticky="ew", padx=(3, 0))
-
-        ttk.Label(main_frame, text="输入 API Key，选择提供商，保存即可使用 AI 指令动作",
-                  font=("Microsoft YaHei UI", 8), foreground="#666").pack(pady=(10, 0))
-
-    def _on_provider_change(self, event):
-        selected = self.provider_var.get()
-        provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected
-        if self.providers and provider_key in self.providers:
-            default_model = self.providers[provider_key].get('model', '')
-            if not self.model_var.get():
-                self.model_var.set(default_model)
-
-    def _test_connection(self):
-        try:
-            import vlm_engine, io
-            selected = self.provider_var.get()
-            provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected
-            api_key = self.api_key_var.get().strip()
-            if not api_key:
-                messagebox.showwarning("提示", "请先输入 API Key", parent=self.dialog)
-                return
-            config = vlm_engine.DEFAULT_CONFIG.copy()
-            config.update({'provider': provider_key, 'api_key': api_key,
-                           'timeout': self.timeout_var.get(),
-                           'system_prompt': "你是一个助手，直接回答用户问题即可。"})
-            if self.model_var.get().strip():
-                config['model'] = self.model_var.get().strip()
-            if self.providers and provider_key in self.providers:
-                config['base_url'] = self.providers[provider_key].get('base_url', '')
-            self.dialog.config(cursor="watch")
-            self.dialog.update()
-            from PIL import ImageGrab
-            screenshot = ImageGrab.grab()
-            buf = io.BytesIO()
-            screenshot.save(buf, format='JPEG', quality=85)
-            image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-            vlm_engine.call_vlm_api("描述你看到了什么？", image_b64=image_b64, config=config)
-            messagebox.showinfo("成功", "API 连接成功！", parent=self.dialog)
-        except Exception as e:
-            messagebox.showerror("错误", f"连接失败:\n{str(e)}", parent=self.dialog)
-        finally:
-            self.dialog.config(cursor="")
-
-    def _save(self):
-        try:
-            import vlm_engine
-            selected = self.provider_var.get()
-            provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected
-            config = vlm_engine.DEFAULT_CONFIG.copy()
-            config['provider'] = provider_key
-            config['api_key'] = self.api_key_var.get().strip()
-            config['timeout'] = self.timeout_var.get()
-            if self.model_var.get().strip():
-                config['model'] = self.model_var.get().strip()
-            if self.providers and provider_key in self.providers:
-                config['base_url'] = self.providers[provider_key].get('base_url', '')
-            if vlm_engine.save_config(config):
-                self.result = config
-                self.dialog.destroy()
-            else:
-                messagebox.showerror("错误", "保存配置失败", parent=self.dialog)
-        except Exception as e:
-            messagebox.showerror("错误", f"保存失败: {e}", parent=self.dialog)
-
-# =================================================================
-# 8. 图片提示管理器 (ImageTooltipManager)
-# =================================================================
-class ImageTooltipManager:
-    """[修复 BUG-1] 接受 steps 列表或 getter 函数，兼容两种调用方式"""
-    def __init__(self, treeview, steps_or_getter):
-        self.tree = treeview
-        # 支持传入 lambda: self.steps 或直接传入 list
-        self._getter = steps_or_getter if callable(steps_or_getter) else lambda: steps_or_getter
-        self.tooltip = None
-        self.current_item = None
-        self._bind_events()
-
-    def _bind_events(self):
-        self.tree.bind('<Motion>', self._on_motion)
-        self.tree.bind('<Leave>', self._on_leave)
-
-    def _on_motion(self, event):
-        item = self.tree.identify_row(event.y)
-        if item != self.current_item:
-            self.current_item = item
-            self._hide_tooltip()
-            if item:
-                self._show_tooltip(item, event.x_root, event.y_root)
-
-    def _on_leave(self, event):
-        self._hide_tooltip()
-        self.current_item = None
-
-    def _show_tooltip(self, item, x, y):
-        try:
-            steps = self._getter()
-            if not steps:
-                return
-            idx = self.tree.index(item)
-            if idx < 0 or idx >= len(steps):
-                return
-
-            step = steps[idx]
-            action = step.get('action', '')
-            params = step.get('params', {})
-
-            if action not in ('FIND_IMAGE', 'IF_IMAGE_FOUND'):
-                return
-
-            img_path = params.get('path', '')
-            if not img_path or not os.path.exists(img_path):
-                return
-
-            img = Image.open(img_path)
-            img.thumbnail((200, 150), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
-
-            self.tooltip = tk.Toplevel(self.tree)
-            self.tooltip.wm_overrideredirect(True)
-            self.tooltip.wm_geometry(f"+{x+15}+{y+15}")
-
-            label = ttk.Label(self.tooltip, image=photo)
-            label.image = photo
-            label.pack()
-
-            info_text = f"{os.path.basename(img_path)}\n{img.size[0]}x{img.size[1]}"
-            ttk.Label(self.tooltip, text=info_text, font=("Microsoft YaHei UI", 8)).pack()
-
-        except Exception as e:
-            print(f"图片提示加载失败: {e}")
-
-    def _hide_tooltip(self):
-        if self.tooltip:
-            self.tooltip.destroy()
-            self.tooltip = None
-
-# =================================================================
-# 9. 迷你状态窗口 (MiniStatusWindow)
-# [修复 BUG-2] 恢复完整接口：stop_callback + update_status(status, loop)
-# =================================================================
-class MiniStatusWindow:
-    """
-    宏执行时的迷你悬浮状态栏窗口
-    - 无边框、始终置顶，显示于屏幕左下角
-    - 点击可停止宏
-    """
-    def __init__(self, parent, stop_callback):
-        self.parent = parent
-        self.stop_callback = stop_callback
-
-        self.window = tk.Toplevel(parent)
-        self.window.overrideredirect(True)
-        self.window.attributes('-topmost', True)
-
-        window_width = 500
-        window_height = 35
-        screen_height = self.window.winfo_screenheight()
-        self.window.geometry(f"{window_width}x{window_height}+10+{screen_height - window_height - 50}")
-
-        main_frame = ttk.Frame(self.window, bootstyle="primary", padding=0)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.status_label = ttk.Label(
-            main_frame, text="运行中...",
-            relief=tk.FLAT, anchor=tk.W, padding=(8, 5),
-            bootstyle="primary-inverse", font=("Microsoft YaHei UI", 9)
-        )
-        self.status_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.loop_label = ttk.Label(
-            main_frame, text="",
-            relief=tk.FLAT, anchor=tk.E, padding=(0, 5, 8, 5),
-            bootstyle="primary-inverse", font=("Microsoft YaHei UI", 9)
-        )
-        self.loop_label.pack(side=tk.RIGHT)
-
-        for w in (main_frame, self.status_label, self.loop_label):
-            w.bind("<Button-1>", self._on_click)
-            w.bind("<Enter>", lambda e: self.window.config(cursor="hand2"))
-            w.bind("<Leave>", lambda e: self.window.config(cursor=""))
-
-    def _on_click(self, event):
-        if self.stop_callback:
-            self.stop_callback()
-
-    def update_status(self, status_text, loop_text=""):
-        """更新状态栏显示内容"""
-        try:
-            if self.window.winfo_exists():
-                self.status_label.config(text=status_text)
-                self.loop_label.config(text=loop_text)
-        except tk.TclError:
-            pass
-
-    def destroy(self):
-        try:
-            if self.window.winfo_exists():
-                self.window.destroy()
-        except tk.TclError:
-            pass
 
 
 # ======================================================================
@@ -679,7 +92,8 @@ class ParamWidgetFactory:
                                    bootstyle="primary-round-toggle")
         checkbox.pack(anchor="w")
         frame.pack(fill=tk.X, pady=8)
-        return var  # 返回 BooleanVar
+        var._param_frame = frame
+        return var
 
     def create_param_combobox(self, parent, key, label_text, values, default=None):
         """创建下拉框"""
@@ -761,6 +175,343 @@ class ParamWidgetFactory:
             return os.path.abspath(f)
         return None
 
+    def build_action_form(self, action_key, parent_frame, param_widgets, available_ocr_keys, callbacks):
+        """
+        构建指定动作类型的参数表单界面
+        
+        Args:
+            action_key: 动作类型键名 (如 'FIND_IMAGE')
+            parent_frame: 容纳参数控件的父容器
+            param_widgets: 用于存储控件引用的字典
+            available_ocr_keys: 可用的 OCR 引擎列表
+            callbacks: 包含各类回调函数的字典
+        """
+        # 快捷访问回调
+        on_select_region = callbacks.get('on_select_region')
+        browse_image_cb = callbacks.get('browse_image')
+        on_test_find_image = callbacks.get('on_test_find_image_click')
+        on_test_find_text = callbacks.get('on_test_find_text_click')
+        on_test_ai_command = callbacks.get('on_test_ai_command_click')
+        update_loop_params_cb = callbacks.get('update_loop_params')
+        update_run_params_cb = callbacks.get('update_run_params')
+        mouse_tracker = callbacks.get('mouse_tracker')
+        mouse_pos_var = callbacks.get('mouse_pos_var')
+
+        if action_key in ('FIND_TEXT', 'IF_TEXT_FOUND'):
+            if 'none' in available_ocr_keys:
+                self.create_hint_label(parent_frame, 
+                    "FAIL 错误: 未找到可用的OCR引擎。\n"
+                    "请先安装 RapidOCR (推荐) 或 Tesseract，\n"
+                    "然后重启本程序。",
+                    bootstyle="danger")
+                # 这里不能直接修改 action_type，因为它是 UI 层的变量。
+                # 告知调用者需要切回图像模式。
+                return "SWITCH_TO_FIND_IMAGE"
+
+        if action_key == 'FIND_IMAGE':
+            param_widgets['path'] = self.create_param_entry(parent_frame, "path", "图像路径:", "button.png")
+            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+            param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", "置信度(0.1-1.0):", "0.8")
+            self.create_hint_label(parent_frame, "* 提示：如果识别失败，请调低置信度")
+            self.create_browse_button(parent_frame, browse_image_cb)
+            self.create_test_button(parent_frame, "🧪 测试查找图像", on_test_find_image)
+            
+        elif action_key == 'FIND_TEXT':
+            param_widgets['text'] = self.create_param_entry(parent_frame, "text", "查找的文本:", "确定")
+            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+            param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
+            param_widgets['engine'] = self.create_ocr_engine_combobox(parent_frame, available_ocr_keys)
+            
+            param_widgets['save_to_clipboard'] = self.create_param_checkbox(parent_frame, "save_to_clipboard", "[OK] 保存识别结果到剪贴板", default=False)
+            _sub_ft = ttk.Frame(parent_frame)
+            _sub_ft.pack(fill=tk.X)
+            _ep_frame_ft = ttk.Frame(_sub_ft)
+            ttk.Label(_ep_frame_ft, text="提取模式 (正则，可选):", font=self.font_ui).pack(anchor="w")
+            _ep_entry_ft = ttk.Entry(_ep_frame_ft, width=25, font=self.font_ui)
+            _ep_entry_ft.insert(0, r"\d+")
+            _ep_entry_ft.pack(anchor="w", fill=tk.X)
+            param_widgets['extract_pattern'] = _ep_entry_ft
+            _hint_ft = AutoWrapLabel(_sub_ft, text="提取模式: 用正则表达式过滤识别结果，如 \\d+ 只提取数字；留空则保存全部文本。", font=self.font_ui, style="secondary.TLabel")
+
+            def _toggle_ft(var=param_widgets['save_to_clipboard'], ef=_ep_frame_ft, hint=_hint_ft):
+                if var.get():
+                    ef.pack(fill=tk.X, pady=8); hint.pack(anchor="w", pady=5, fill=tk.X)
+                else:
+                    ef.pack_forget(); hint.pack_forget()
+            param_widgets['save_to_clipboard'].trace_add('write', lambda *_: _toggle_ft())
+            self.create_test_button(parent_frame, "🧪 测试查找文本 (OCR)", on_test_find_text)
+            
+        elif action_key == 'MOVE_OFFSET':
+            param_widgets['x_offset'] = self.create_param_entry(parent_frame, "x_offset", "X 偏移:", "10")
+            param_widgets['y_offset'] = self.create_param_entry(parent_frame, "y_offset", "Y 偏移:", "0")
+            
+        elif action_key == 'CLICK':
+            param_widgets['button'] = self.create_param_combobox(parent_frame, "button", "按键:", list(MacroSchema.CLICK_OPTIONS.keys()))
+        
+        elif action_key == 'SCROLL':
+            param_widgets['amount'] = self.create_param_entry(parent_frame, "amount", "滚动量 (正数=上, 负数=下):", "100")
+            param_widgets['x'] = self.create_param_entry(parent_frame, "x", "X 坐标 (可选):", "")
+            param_widgets['y'] = self.create_param_entry(parent_frame, "y", "Y 坐标 (可选):", "")
+            self.create_hint_label(parent_frame, "* 提示: 如果 X, Y 为空，将在当前鼠标位置滚动。")
+
+        elif action_key == 'WAIT':
+            param_widgets['ms'] = self.create_param_entry(parent_frame, "ms", "等待 (毫秒):", "500")
+            
+        elif action_key == 'TYPE_TEXT':
+            param_widgets['text'] = self.create_param_entry(parent_frame, "text", "输入文本:", "你好")
+            self.create_hint_label(parent_frame, "* 此功能使用剪贴板 (Ctrl+V)，以支持中文及复杂文本输入。\n* 支持占位符: {CLIPBOARD} 将替换为剪贴板内容\n* 示例: '订单号: {CLIPBOARD}' → '订单号: 12345'")
+            
+        elif action_key == 'PRESS_KEY':
+            param_widgets['key'] = self.create_param_entry(parent_frame, "key", "按键或组合键 (Enter, Ctrl+C):", "Enter")
+        
+        elif action_key == 'AI_COMMAND':
+            param_widgets['instruction'] = self.create_param_entry(parent_frame, "instruction", "AI 指令:", "点击列表里价格最低的那个商品")
+            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+            self.create_hint_label(parent_frame, "* 提示: 输入自然语言指令，如 '点击确定按钮'\n* AI 会分析屏幕截图，理解指令并返回坐标\n* 支持: OpenAI, Anthropic, DeepSeek, 智谱, 通义千问等")
+            self.create_test_button(parent_frame, "🧪 测试 AI 指令", on_test_ai_command)
+        
+        elif action_key == 'ACTIVATE_WINDOW':
+            param_widgets['title'] = self.create_param_entry(parent_frame, "title", "窗口标题 (支持部分匹配):", "记事本")
+            self.create_hint_label(parent_frame, "* 提示: 宏将查找标题中包含此文本的窗口，并将其激活到最前端。")
+        
+        elif action_key == 'NOTE':
+            param_widgets['text'] = self.create_param_entry(parent_frame, "text", "备注内容:", "这里是需要备注的文本...")
+            self.create_hint_label(parent_frame, "* 注意: 此步骤仅作为注释，不会执行任何操作。\n* 可用于标注宏的执行流程，方便理解和定位。")
+
+        elif action_key == 'RUN':
+            run_type_options = {'command (命令)': 'command', 'script (脚本)': 'script', 'file (写入文件)': 'file'}
+            param_widgets['run_type'] = self.create_param_combobox(parent_frame, "run_type", "类型:", list(run_type_options.keys()), default='command (命令)')
+            param_widgets['command'] = self.create_param_entry(parent_frame, "command", "命令:", "curl")
+            param_widgets['args'] = self.create_param_entry(parent_frame, "args", "参数:", "")
+            param_widgets['script_path'] = self.create_param_entry(parent_frame, "script_path", "脚本路径:", "process.py")
+            param_widgets['interpreter'] = self.create_param_combobox(parent_frame, "interpreter", "解释器:", ["python", "node", "powershell"], default="python")
+            param_widgets['file_path'] = self.create_param_entry(parent_frame, "file_path", "文件路径:", "result.txt")
+            param_widgets['content'] = self.create_param_entry(parent_frame, "content", "文件内容:", "Hello World")
+            param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
+            param_widgets['timeout'] = self.create_param_entry(parent_frame, "timeout", "超时(秒):", "30")
+            param_widgets['cwd'] = self.create_param_entry(parent_frame, "cwd", "工作目录:", "")
+            param_widgets['append'] = self.create_param_checkbox(parent_frame, "append", "[OK] 追加模式 (文件)", default=False)
+            param_widgets['save_output'] = self.create_param_checkbox(parent_frame, "save_output", "[OK] 保存输出到剪贴板", default=False)
+            param_widgets['shell_mode'] = self.create_param_checkbox(parent_frame, "shell_mode", "[警告] shell 模式 (仅可信宏)", default=False)
+            param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] RUN 失败时停止宏", default=False)
+            self.create_hint_label(parent_frame, "* {CLIPBOARD} = 剪贴板内容, {DATETIME} = 当前时间")
+            if 'run_type' in param_widgets:
+                param_widgets['run_type'].bind("<<ComboboxSelected>>", update_run_params_cb)
+            update_run_params_cb(None)
+
+        elif action_key == 'MOVE_TO':
+            param_widgets['x'] = self.create_param_entry(parent_frame, "x", "X 坐标:", "100")
+            param_widgets['y'] = self.create_param_entry(parent_frame, "y", "Y 坐标:", "100")
+            ttk.Separator(parent_frame, orient='horizontal').pack(fill='x', pady=(15, 5))
+            ttk.Label(parent_frame, text="当前鼠标位置 (参考):", font=self.font_ui, foreground='gray').pack(anchor="w", pady=(5,0))
+            ttk.Label(parent_frame, textvariable=mouse_pos_var, font=self.font_code, bootstyle="info").pack(anchor="w")
+            mouse_tracker.start()
+            
+        elif action_key == 'IF_IMAGE_FOUND':
+            param_widgets['path'] = self.create_param_entry(parent_frame, "path", "图像路径:", "button.png")
+            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+            param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", "置信度:", "0.8")
+            self.create_browse_button(parent_frame, browse_image_cb)
+            self.create_test_button(parent_frame, "🧪 测试 IF 图像", on_test_find_image)
+            
+        elif action_key == 'IF_TEXT_FOUND':
+            param_widgets['text'] = self.create_param_entry(parent_frame, "text", "查找文本:", "确定")
+            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+            param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
+            param_widgets['engine'] = self.create_ocr_engine_combobox(parent_frame, available_ocr_keys)
+            param_widgets['save_to_clipboard'] = self.create_param_checkbox(parent_frame, "save_to_clipboard", "[OK] 保存识别结果到剪贴板", default=False)
+            _sub_ift = ttk.Frame(parent_frame); _sub_ift.pack(fill=tk.X)
+            _ep_frame_ift = ttk.Frame(_sub_ift)
+            ttk.Label(_ep_frame_ift, text="提取模式 (正则，可选):", font=self.font_ui).pack(anchor="w")
+            _ep_entry_ift = ttk.Entry(_ep_frame_ift, width=25, font=self.font_ui); _ep_entry_ift.insert(0, r"\d+"); _ep_entry_ift.pack(anchor="w", fill=tk.X)
+            param_widgets['extract_pattern'] = _ep_entry_ift
+            _hint_ift = AutoWrapLabel(_sub_ift, text="提取模式: 用正则表达式过滤识别结果，如 \\d+ 只提取数字；留空则保存全部文本。", font=self.font_ui, style="secondary.TLabel")
+
+            def _toggle_ift(var=param_widgets['save_to_clipboard'], ef=_ep_frame_ift, hint=_hint_ift):
+                if var.get():
+                    ef.pack(fill=tk.X, pady=8); hint.pack(anchor="w", pady=5, fill=tk.X)
+                else:
+                    ef.pack_forget(); hint.pack_forget()
+            param_widgets['save_to_clipboard'].trace_add('write', lambda *_: _toggle_ift())
+            self.create_test_button(parent_frame, "🧪 测试 IF 文本", on_test_find_text)
+            
+        elif action_key == 'LOOP_START':
+            mode_options = {'固定次数': 'fixed', '直到找到图像': 'until_image', '直到找到文本': 'until_text'}
+            param_widgets['mode'] = self.create_param_combobox(parent_frame, "mode", "循环模式:", list(mode_options.keys()), default='固定次数')
+            param_widgets['times'] = self.create_param_entry(parent_frame, "times", "循环次数:", "10")
+            param_widgets['max_iterations'] = self.create_param_entry(parent_frame, "max_iterations", "最大迭代次数 (安全阀):", "1000")
+            param_widgets['condition_image'] = self.create_param_entry(parent_frame, "condition_image", "目标图像路径:", "target.png")
+            param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", "置信度:", "0.8")
+            param_widgets['condition_text'] = self.create_param_entry(parent_frame, "condition_text", "目标文本:", "加载完成")
+            param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
+            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+            self.create_hint_label(parent_frame, "* 提示:\n- 固定次数: 传统循环\n- 直到找到图像: 找到即停\n- 直到找到文本: 找到即停\n- 最大迭代: 安全机制")
+            if 'mode' in param_widgets:
+                param_widgets['mode'].bind("<<ComboboxSelected>>", update_loop_params_cb)
+            update_loop_params_cb(None)
+
+        elif action_key == 'ELSE':
+            self.create_hint_label(parent_frame, "* 提示: 'ELSE' 必须与 'IF' 配合使用。")
+        elif action_key == 'END_IF':
+            self.create_hint_label(parent_frame, "* 提示: 'END_IF' 标志着逻辑块结束。")
+        elif action_key == 'END_LOOP':
+            self.create_hint_label(parent_frame, "* 提示: 'END_LOOP' 标志着循环结束。")
+            
+        return None
+
+    def collect_step_data(self, action_key, param_widgets, engine_key_map=None):
+        """
+        从参数控件中收集并校验数据
+        
+        Returns:
+            params: 整理后的参数字典
+            error: 错误消息，若无错误则为 None
+        """
+        params = {}
+        try:
+            for k, w in param_widgets.items():
+                # 处理 BooleanVar (复选框)
+                if isinstance(w, tk.BooleanVar):
+                    params[k] = w.get()
+                    continue
+                
+                val = w.get()
+                
+                # 数字校验
+                if k in ['x', 'y', 'ms', 'times', 'x_offset', 'y_offset', 'amount', 'max_iterations', 'timeout']:
+                    if val:
+                        if k in ('ms', 'times', 'max_iterations'):
+                            try:
+                                parsed_int = int(val.strip())
+                            except (ValueError, TypeError):
+                                return None, f"参数 '{k}' 必须是非负整数"
+                            if parsed_int < 0:
+                                return None, f"参数 '{k}' 必须是非负整数"
+                        elif k == 'timeout':
+                            # [P2修复] timeout 要求正整数，≤0 无意义
+                            try:
+                                parsed_timeout = int(val.strip())
+                            except (ValueError, TypeError):
+                                return None, "参数 'timeout' 必须是正整数（如 30）"
+                            if parsed_timeout <= 0:
+                                return None, "参数 'timeout' 必须大于 0"
+                        else:
+                            try:
+                                int(val.strip())
+                            except (ValueError, TypeError):
+                                return None, f"参数 '{k}' 必须是整数"
+                
+                # confidence 浮点校验
+                if k == 'confidence' and val:
+                    try:
+                        cf = float(val.strip())
+                        if not (0.0 < cf <= 1.0):
+                            return None, "参数 'confidence' 必须在 0.0 ~ 1.0 之间"
+                    except (ValueError, TypeError):
+                        return None, "参数 'confidence' 必须是数字（如 0.8）"
+
+                
+                if action_key == 'SCROLL' and k in ['x', 'y'] and not val:
+                    continue
+                
+                if not val:
+                    if k in ('region', 'extract_pattern'): pass
+                    elif action_key in ('ELSE', 'END_IF', 'END_LOOP', 'NOTE'): continue
+                    elif action_key in ('SCROLL', 'CLICK') and k in ('x', 'y'): continue
+                    elif action_key == 'RUN': continue
+                    else: return None, f"参数 '{k}' 不能为空"
+                
+                # 参数转换
+                if k == 'mode':
+                    params[k] = {'固定次数': 'fixed', '直到找到图像': 'until_image', '直到找到文本': 'until_text'}.get(val, 'fixed')
+                elif k == 'run_type':
+                    params[k] = {'command (命令)': 'command', 'script (脚本)': 'script', 'file (写入文件)': 'file'}.get(val, 'command')
+                elif k == 'lang':
+                    params[k] = MacroSchema.LANG_OPTIONS.get(val, 'eng')
+                elif k == 'button':
+                    params[k] = MacroSchema.CLICK_OPTIONS.get(val, 'left')
+                elif k == 'engine':
+                    if engine_key_map:
+                        params[k] = engine_key_map.get(val, 'auto')
+                    else:
+                        params[k] = val.split(' ')[0] 
+                elif k == 'region':
+                    if val.strip():
+                        coords = parse_region_string(val)
+                        if coords: params['cache_box'] = coords
+                elif k == 'extract_pattern':
+                    if val and val.strip(): params[k] = val.strip()
+                else:
+                    params[k] = val
+
+            # RUN 动作参数清洗
+            if action_key == 'RUN':
+                run_type = params.get('run_type', 'command')
+                if run_type == 'command' and not params.get('command'): return None, "RUN 命令类型必须填写 '命令'"
+                elif run_type == 'script' and not params.get('script_path'): return None, "RUN 脚本类型必须填写 '脚本路径'"
+                elif run_type == 'file' and not params.get('file_path'): return None, "RUN 文件类型必须填写 '文件路径'"
+
+                common_keys = ['run_type', 'timeout', 'cwd', 'save_output', 'fail_stop']
+                keep_keys = common_keys + (['command', 'args', 'shell_mode'] if run_type == 'command' else 
+                                         (['script_path', 'interpreter', 'args'] if run_type == 'script' else 
+                                          ['file_path', 'content', 'append', 'encoding']))
+                
+                new_params = {}
+                for k in keep_keys:
+                    if k in params:
+                        v = params[k]
+                        if k == 'timeout' and v == '30': continue
+                        if k == 'interpreter' and v == 'python': continue
+                        if k == 'append' and not v: continue
+                        if k == 'save_output' and not v: continue
+                        if k == 'shell_mode' and not v: continue
+                        if k == 'fail_stop' and not v: continue
+                        if k == 'encoding' and v == 'utf-8': continue
+                        if v is not None and (isinstance(v, bool) or str(v).strip()):
+                            new_params[k] = v
+                params = new_params
+
+            # LOOP_START 动作参数清洗
+            if action_key == 'LOOP_START':
+                mode = params.get('mode', 'fixed')
+
+                if mode == 'fixed':
+                    keep_keys = ['mode', 'times']
+                elif mode == 'until_image':
+                    keep_keys = ['mode', 'condition_image', 'confidence', 'max_iterations', 'cache_box']
+                elif mode == 'until_text':
+                    keep_keys = ['mode', 'condition_text', 'lang', 'max_iterations', 'cache_box']
+                else:
+                    keep_keys = ['mode', 'times']
+
+                new_params = {}
+                for k in keep_keys:
+                    if k in params:
+                        new_params[k] = params[k]
+
+                # 基础必填校验（按模式）
+                if mode == 'fixed' and not str(new_params.get('times', '')).strip():
+                    return None, "参数 'times' 不能为空"
+                if mode == 'until_image' and not str(new_params.get('condition_image', '')).strip():
+                    return None, "参数 'condition_image' 不能为空"
+                if mode == 'until_text' and not str(new_params.get('condition_text', '')).strip():
+                    return None, "参数 'condition_text' 不能为空"
+
+                params = new_params
+
+            # 路径有效性校验
+            for path_key in ['path', 'condition_image']:
+                if path_key in params and params[path_key]:
+                    p = params[path_key]
+                    if not os.path.exists(p): return None, f"文件不存在: {p}"
+                    if not p.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                        return None, f"文件格式错误 (仅支持图片): {os.path.basename(p)}"
+
+            return params, None
+        except Exception as e:
+            return None, str(e)
+
+
 
 # ======================================================================
 # 参数动态显示控制函数（从 MacroAssistant.py 迁移）
@@ -795,8 +546,7 @@ def update_loop_params(param_widgets, param_frame, mode_widget):
     # 隐藏所有条件参数
     for key in ['times', 'condition_image', 'confidence', 'condition_text', 'lang', 'max_iterations', 'region']:
         if key in param_widgets:
-            widget = param_widgets[key]
-            parent_frame = widget.master
+            parent_frame = _get_widget_frame(param_widgets[key])
             if parent_frame:
                 parent_frame.pack_forget()
 
@@ -812,12 +562,21 @@ def update_loop_params(param_widgets, param_frame, mode_widget):
     # 显示参数
     for key in params_to_show:
         if key in param_widgets:
-            param_widgets[key].master.pack(fill=tk.X, pady=8)
+            frame = _get_widget_frame(param_widgets[key])
+            if frame:
+                frame.pack(fill=tk.X, pady=8)
 
     # 确保提示标签始终在最后
     for hint_label in hint_labels:
         hint_label.pack_forget()
         hint_label.pack(anchor="w", pady=5, fill=tk.X)
+
+
+def _get_widget_frame(widget):
+    """获取控件的父容器 frame，兼容 BooleanVar 和普通 tk Widget"""
+    if isinstance(widget, tk.BooleanVar):
+        return getattr(widget, '_param_frame', None)
+    return widget.master
 
 
 def update_run_params(param_widgets, param_frame, run_type_widget):
@@ -847,17 +606,16 @@ def update_run_params(param_widgets, param_frame, run_type_widget):
         if isinstance(widget, AutoWrapLabel):
             hint_labels.append(widget)
 
-    # 各类型对应的参数
-    command_params = ['command', 'args']
-    script_params = ['script_path', 'interpreter']
-    file_params = ['file_path', 'content']
+    # 各类型对应的参数。除了 run_type，本函数统一接管 RUN 的字段可见性。
+    command_params = ['command', 'args', 'timeout', 'cwd', 'save_output', 'shell_mode', 'fail_stop']
+    script_params = ['script_path', 'interpreter', 'args', 'timeout', 'cwd', 'save_output', 'fail_stop']
+    file_params = ['file_path', 'content', 'append', 'encoding']
 
-    # 隐藏所有类型的参数
-    all_type_params = command_params + script_params + file_params
+    # 隐藏所有 RUN 参数，避免编辑已有步骤时把命令/脚本/文件字段全部展开。
+    all_type_params = sorted(set(command_params + script_params + file_params))
     for key in all_type_params:
         if key in param_widgets:
-            widget = param_widgets[key]
-            parent_frame = widget.master
+            parent_frame = _get_widget_frame(param_widgets[key])
             if parent_frame:
                 parent_frame.pack_forget()
 
@@ -873,7 +631,7 @@ def update_run_params(param_widgets, param_frame, run_type_widget):
 
     for key in params_to_show:
         if key in param_widgets:
-            frame = param_widgets[key].master
+            frame = _get_widget_frame(param_widgets[key])
             if frame:
                 frame.pack(fill=tk.X, pady=8)
 

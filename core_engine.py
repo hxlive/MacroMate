@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
 # 描述:自动化宏的核心功能引擎
-# 版本:1.6.5
+# 版本:1.7.0
 # # 变更:(修复) 新增 MacroStopException，实现快捷键即时中断
 
 # ======================================================================
@@ -18,11 +18,65 @@ import time
 from PIL import Image, ImageGrab, ImageStat
 import re
 import pyperclip
+import json
 import os
 import sys
 import subprocess
-from collections import defaultdict
-import functools 
+import shlex
+import ctypes
+import functools
+
+if sys.platform == 'win32':
+    ctypes.windll.shell32.CommandLineToArgvW.argtypes = (ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int))
+    ctypes.windll.shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    ctypes.windll.kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    ctypes.windll.kernel32.LocalFree.restype = ctypes.c_void_p
+
+# ======================================================================
+# 7. 宏文件持久化工具 (从 MacroAssistant.py 迁移)
+# ======================================================================
+class MacroPersistence:
+    @staticmethod
+    def convert_to_native(obj):
+        """递归转换所有值为 Python 原生类型 (处理 numpy 等类型)"""
+        try:
+            import numpy as np
+            numpy_types = (np.integer, np.floating)
+        except ImportError:
+            numpy_types = ()
+            
+        if isinstance(obj, dict):
+            return {k: MacroPersistence.convert_to_native(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [MacroPersistence.convert_to_native(item) for item in obj]
+        elif numpy_types and isinstance(obj, numpy_types):
+            return obj.item()
+        else:
+            return obj
+
+    @staticmethod
+    def save(file_path, steps):
+        native_steps = MacroPersistence.convert_to_native(steps)
+        tmp_path = file_path + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write('[\n')
+            for i, step in enumerate(native_steps):
+                step_str = json.dumps(step, ensure_ascii=False)
+                if i < len(native_steps) - 1:
+                    f.write(f'    {step_str},\n')
+                else:
+                    f.write(f'    {step_str}\n')
+            f.write(']\n')
+        os.replace(tmp_path, file_path)
+
+    @staticmethod
+    def load(file_path):
+        """从 JSON 文件加载宏"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data
+
+
 
 try:
     import pygetwindow as gw
@@ -41,9 +95,8 @@ LOOP_CHECK_INTERVAL = 0.2  # 优化: 从 0.5s 降低到 0.2s (平衡流畅度与
 # 性能与缓存相关常量
 LOOP_PHYSICAL_COOLDOWN = 0.05  # 循环物理冷却时间（秒），防止队列瞬间爆炸
 CACHE_BOX_PADDING = 50  # 缓存区域扩展边距（像素）
-TEMPLATE_CACHE_SIZE = 500  # 模板缓存大小（优化：从100增加到500）
-QUICK_CHECK_SCALES = [1.0, 0.9, 1.1]  # 快速检查尝试的缩放比例
-
+TEMPLATE_CACHE_SIZE = 200  # 模板缓存大小，限制大图/多缩放场景的内存占用
+QUICK_CHECK_SCALES = (1.0, 0.9, 1.1)  # 快速检查尝试的缩放比例
 
 
 try:
@@ -68,10 +121,10 @@ try:
     import cv2
     import numpy as np 
     OPENCV_AVAILABLE = True
-    print("[配置] OK OpenCV 引擎就绪 (极速找图内核已可用)")
+    print("[CONFIG] OpenCV engine ready")
 except ImportError:
     OPENCV_AVAILABLE = False
-    print("[配置] FAIL 未找到 OpenCV。将回退到慢速找图模式。")
+    print("[CONFIG] OpenCV not found, fallback to slower image matching")
 
 # ======================================================================
 # 快捷键工具模块
@@ -93,16 +146,14 @@ class HotkeyUtils:
     }
     VK_TO_PYNPUT = {v: k for k, v in PYNPUT_TO_VK.items()}
     
-    try:
-        if sys.platform == 'win32':
-            import win32con
-            PYNPUT_MOD_TO_WIN_MOD = {
-                'ctrl': win32con.MOD_CONTROL, 'alt': win32con.MOD_ALT,
-                'shift': win32con.MOD_SHIFT, 'cmd': win32con.MOD_WIN,
-            }
-        else:
-            PYNPUT_MOD_TO_WIN_MOD = {}
-    except ImportError:
+    if sys.platform == 'win32':
+        PYNPUT_MOD_TO_WIN_MOD = {
+            'ctrl': 0x0002,  # win32con.MOD_CONTROL
+            'alt': 0x0001,   # win32con.MOD_ALT
+            'shift': 0x0004, # win32con.MOD_SHIFT
+            'cmd': 0x0008,   # win32con.MOD_WIN
+        }
+    else:
         PYNPUT_MOD_TO_WIN_MOD = {}
     
     @staticmethod
@@ -118,7 +169,7 @@ class HotkeyUtils:
                 else:
                     display_parts.append(part.upper())
             return "+".join(display_parts)
-        except:
+        except Exception:
             return hotkey_str.upper()
 
 # ======================================================================
@@ -226,16 +277,49 @@ loop_cache = LoopCacheManager()
 # ======================================================================
 # 核心工具函数
 # ======================================================================
-def smart_screenshot(region=None):
+def _safe_int(value, default=None, min_value=None, max_value=None):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default, False
+    if min_value is not None and result < min_value:
+        return default, False
+    if max_value is not None and result > max_value:
+        return default, False
+    return result, True
+
+def _safe_float(value, default=None, min_value=None, max_value=None):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default, False
+    if min_value is not None and result < min_value:
+        return default, False
+    if max_value is not None and result > max_value:
+        return default, False
+    return result, True
+
+def _warn_param_default(action, name, default):
+    print(f"  [WARN] {action} invalid parameter '{name}', using default: {default}")
+
+def _error_param_skip(action, name, expected):
+    print(f"  [ERROR] {action} invalid parameter '{name}', expected {expected}; step skipped")
+
+def _console_safe_text(value):
+    """Return text that can be printed even when stdout uses a legacy code page."""
+    text = str(value)
+    encoding = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+    return text.encode(encoding, errors='replace').decode(encoding, errors='replace')
+
+def smart_screenshot(region=None, pad=0):
     if region:
-        pad = 0
         x = max(0, region[0] - pad)
         y = max(0, region[1] - pad)
         return ImageGrab.grab(bbox=(x, y, region[0]+region[2]+pad, region[1]+region[3]+pad)), (x, y)
     return ImageGrab.grab(), (0, 0)
 
-SCALES = [1.0, 0.9, 1.1, 0.8, 1.2]
-@functools.lru_cache(maxsize=500)  # [优化] 增大缓存以减少文件读取
+SCALES = (1.0, 0.9, 1.1, 0.8, 1.2)
+@functools.lru_cache(maxsize=TEMPLATE_CACHE_SIZE)  # [优化] 增大缓存以减少文件读取
 def _get_template(path, scale):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None: return None, 0, 0
@@ -299,25 +383,26 @@ def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc, enhanced_mod
             if r <= l or b <= t: continue
             
             crop = cv2.cvtColor(np.array(screenshot_pil.crop((l, t, r, b))), cv2.COLOR_RGB2GRAY)
+            if crop.shape[0] < th or crop.shape[1] < tw:
+                continue
             _, max_v, _, _ = cv2.minMaxLoc(cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED))
             
             if max_v >= conf:
                 return True  # 找到匹配，立即返回
         
         return False  # 所有缩放比例都不匹配
-    except (cv2.error, ValueError, TypeError, AttributeError, IndexError) as e:
-        # [补丁优化] 记录异常详情，便于调试
+    except (ValueError, TypeError, AttributeError, IndexError) + ((cv2.error,) if OPENCV_AVAILABLE else ()) as e:
+        # Loop cache misses can happen frequently; keep this hot path quiet.
         print(f"[quick_check_cv2] 异常: {e}")
-        import traceback
-        traceback.print_exc()
         return False
 
 # ======================================================================
 # 主执行引擎
 # ======================================================================
 def execute_steps(steps, run_context=None, status_callback=None):
-    print(f"\n--- 宏执行开始 (Core V1.6.0) ---")
+    print(f"\n--- 宏执行开始 (Core V1.7.0 Beta) ---")
     perf.reset(); loop_cache.reset()
+    _get_template.cache_clear()
     ctx = run_context if run_context else {}
     ctx.setdefault('last_pos', (None, None))
     ctx.setdefault('stop_requested', False)
@@ -327,7 +412,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
     try:
         s = run_context.get('stop_key_str', default_stop)
         stop_key_display = HotkeyUtils.format_hotkey_display(s)
-    except:
+    except Exception:
         stop_key_display = default_stop
     
     pc, loops = 0, []
@@ -339,7 +424,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
                 break
                 
             step = steps[pc]; act = step.get('action',''); p = step.get('params',{})
-            print(f"[{pc+1}] {act}")
+            if ctx.get('debug_steps', False) or not loops or act in {'LOOP_START', 'END_LOOP', 'ELSE', 'END_IF', 'RUN', 'NOTE'}:
+                print(f"[{pc+1}] {act}")
             next_pc = pc + 1
 
             # [新增] 处理被屏蔽的普通步骤
@@ -363,12 +449,11 @@ def execute_steps(steps, run_context=None, status_callback=None):
                             next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['ELSE', 'END_IF'])
                     elif not res: print("  -> 没找到目标,宏停止"); break
                     
-                    # [修复] 统一处理返回值: (x, y, text) 或 (x, y, w, h)
-                    # FIND_ 和 IF_ 找到目标后均移动鼠标，保持行为一致
-                    # (IF 体内的 CLICK 可直接复用此位置，无需再次 OCR)
+                    # FIND_ 和 IF_ 找到目标后均移动鼠标，保持 2026-05-16 的稳定行为。
+                    # IF 体内的无坐标 CLICK 可以直接点击当前位置。
                     if res:
-                        # 取前两个值作为坐标
                         target_x, target_y = res[0], res[1]
+                        ctx['last_pos'] = (target_x, target_y)
                         pyautogui.moveTo(target_x, target_y)
                 
                 elif act == 'AI_COMMAND':
@@ -393,7 +478,10 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     if coords:
                         target_x, target_y = coords
                         print(f"  [AI] 返回坐标: ({target_x}, {target_y})")
-                        pyautogui.moveTo(target_x, target_y, duration=float(p.get('duration', 0.25)))
+                        duration, ok = _safe_float(p.get('duration', 0.25), 0.25, min_value=0)
+                        if not ok:
+                            _warn_param_default('AI_COMMAND', 'duration', duration)
+                        pyautogui.moveTo(target_x, target_y, duration=duration)
                         ctx['last_pos'] = (target_x, target_y)
                     else:
                         print("  [AI] 未找到目标位置")
@@ -402,47 +490,101 @@ def execute_steps(steps, run_context=None, status_callback=None):
                 
                 elif act == 'CLICK':
                     btn = p.get('button', 'left').lower()
-                    clicks = int(p.get('clicks', 1))
-                    interval = float(p.get('interval', 0.0))
-                    duration = float(p.get('duration', 0.0))
-                    x = int(p['x']) if 'x' in p else None
-                    y = int(p['y']) if 'y' in p else None
+                    clicks, ok = _safe_int(p.get('clicks', 1), None, min_value=1)
+                    if not ok:
+                        _error_param_skip('CLICK', 'clicks', 'positive integer')
+                        pc = next_pc; continue
+                    interval, ok = _safe_float(p.get('interval', 0.0), 0.0, min_value=0)
+                    if not ok:
+                        _warn_param_default('CLICK', 'interval', interval)
+                    duration, ok = _safe_float(p.get('duration', 0.0), 0.0, min_value=0)
+                    if not ok:
+                        _warn_param_default('CLICK', 'duration', duration)
+                    try:
+                        x = int(p.get('x', '')) if str(p.get('x', '')).strip() else None
+                        y = int(p.get('y', '')) if str(p.get('y', '')).strip() else None
+                    except (ValueError, TypeError):
+                        print("  [错误] CLICK 坐标参数无效")
+                        break
                     pyautogui.click(x=x, y=y, button=btn, clicks=clicks, interval=interval, duration=duration)
                     if x is not None and y is not None:
                         ctx['last_pos'] = (x, y)
                 
                 elif act == 'MOVE_TO':
-                    x, y = int(p['x']), int(p['y'])
-                    pyautogui.moveTo(x, y, duration=float(p.get('duration', 0.25)))
+                    try:
+                        x, y = int(p.get('x', 0)), int(p.get('y', 0))
+                    except (ValueError, TypeError):
+                        print("  [错误] MOVE_TO 坐标参数无效")
+                        break
+                    duration, ok = _safe_float(p.get('duration', 0.25), 0.25, min_value=0)
+                    if not ok:
+                        _warn_param_default('MOVE_TO', 'duration', duration)
+                    pyautogui.moveTo(x, y, duration=duration)
                     ctx['last_pos'] = (x, y)
                 
                 elif act == 'MOVE_OFFSET':
-                    if ctx['last_pos'][0] is None or ctx['last_pos'][1] is None: print("  [错误] 无上次坐标"); break
-                    ox, oy = int(p['x_offset']), int(p['y_offset'])
-                    pyautogui.move(ox, oy, duration=float(p.get('duration', 0.25)))
+                    if ctx['last_pos'][0] is None or ctx['last_pos'][1] is None:
+                        print("  [错误] 无上次坐标"); break
+                    try:
+                        ox, oy = int(p.get('x_offset', 0)), int(p.get('y_offset', 0))
+                    except (ValueError, TypeError):
+                        print("  [错误] MOVE_OFFSET 偏移参数无效")
+                        break
+                    duration, ok = _safe_float(p.get('duration', 0.25), 0.25, min_value=0)
+                    if not ok:
+                        _warn_param_default('MOVE_OFFSET', 'duration', duration)
+                    pyautogui.move(ox, oy, duration=duration)
                     ctx['last_pos'] = (ctx['last_pos'][0]+ox, ctx['last_pos'][1]+oy)
                 
                 elif act == 'SCROLL':
-                    clicks = int(p.get('amount', 0))
-                    if 'x' in p and 'y' in p: pyautogui.moveTo(int(p['x']), int(p['y']))
+                    try:
+                        clicks = int(p.get('amount', 0))
+                    except (ValueError, TypeError):
+                        print("  [错误] SCROLL amount 参数无效")
+                        break
+                    try:
+                        if 'x' in p and 'y' in p and str(p.get('x', '')).strip() and str(p.get('y', '')).strip():
+                            pyautogui.moveTo(int(p['x']), int(p['y']))
+                    except (ValueError, TypeError):
+                        print("  [错误] SCROLL 坐标参数无效")
+                        break
                     pyautogui.scroll(clicks) 
                 
-                elif act == 'WAIT': 
-                    total_ms = int(p['ms'])
+                elif act == 'WAIT':
+                    # [P2防御] 防止 JSON 中 ms 为非数字字符串触发 traceback
+                    try:
+                        total_ms = int(p.get('ms', 0))
+                    except (ValueError, TypeError):
+                        print("  [错误] WAIT 参数 'ms' 必须是整数，步骤已跳过")
+                        pc = next_pc; continue
+                    if total_ms <= 0:
+                        print("  [警告] WAIT 未指定有效等待时间，跳过")
+                        pc = next_pc; continue
+                    interrupted = False
                     for _ in range(0, total_ms, 100):
-                        if ctx.get('stop_requested'): break
+                        if ctx.get('stop_requested'):
+                            interrupted = True
+                            break
                         time.sleep(min(100, total_ms - _) / 1000.0)
+                    if interrupted:
+                        raise MacroStopException("用户在等待期间请求停止")
                 
                 elif act == 'TYPE_TEXT':
-                    interval = float(p.get('interval', 0.0))
-                    text = p['text']
+                    interval, ok = _safe_float(p.get('interval', 0.0), 0.0, min_value=0)
+                    if not ok:
+                        _warn_param_default('TYPE_TEXT', 'interval', interval)
+                    text = p.get('text', '')
+                    
+                    if not text:
+                        print("  [警告] TYPE_TEXT 未指定输入文本，跳过")
+                        pc = next_pc; continue
                     
                     if '{CLIPBOARD}' in text:
                         clipboard_content = ctx.get('clipboard_var', '')
                         if not clipboard_content:
                             try:
                                 clipboard_content = pyperclip.paste()
-                            except:
+                            except Exception:
                                 clipboard_content = ''
                         
                         text = text.replace('{CLIPBOARD}', clipboard_content)
@@ -450,21 +592,25 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     
                     if interval > 0: pyautogui.write(text, interval=interval)
                     else: 
-                        # 增加剪贴板重试机制，防止被系统占用报错
-                        # 尝试 3 次，每次间隔 0.2 秒
+                        copy_success = False
                         for _retry in range(3):
+                            if ctx.get('stop_requested'):
+                                raise MacroStopException("用户在输入期间请求停止")
                             try:
                                 pyperclip.copy(text)
-                                break # 成功则跳出重试循环
+                                copy_success = True
+                                break
                             except Exception:
                                 time.sleep(0.2)
                         
-                        # 无论成功与否，尝试粘贴 (pyautogui 不会报错)
-                        time.sleep(0.1)
-                        pyautogui.hotkey('ctrl', 'v')
+                        if copy_success:
+                            time.sleep(0.1)
+                            pyautogui.hotkey('ctrl', 'v')
+                        else:
+                            print("  [错误] 剪贴板复制失败，跳过粘贴")
                 
                 elif act == 'PRESS_KEY':
-                    keys = p.get('key', '').lower().replace(' ', '').split('+')
+                    keys = [k for k in p.get('key', '').lower().replace(' ', '').split('+') if k]
                     if keys: pyautogui.hotkey(*keys)
                 
                 elif act == 'ACTIVATE_WINDOW':
@@ -487,7 +633,10 @@ def execute_steps(steps, run_context=None, status_callback=None):
                             target_win.restore()
                         target_win.activate()
                         print(f"  [成功] 已激活窗口: {target_win.title}")
-                        time.sleep(0.5) 
+                        for _ in range(5):
+                            if ctx.get('stop_requested'):
+                                raise MacroStopException("用户在窗口激活期间请求停止")
+                            time.sleep(0.1) 
                     except Exception as e:
                         print(f"  [错误] 激活窗口时出错: {e}")
                         break
@@ -504,11 +653,13 @@ def execute_steps(steps, run_context=None, status_callback=None):
                 elif act == 'RUN':
                     # 执行命令/脚本/文件
                     run_result = _handle_run(p, ctx)
+                    if run_result == 'SKIPPED':
+                        print("  [RUN] 已跳过，继续执行后续步骤")
                     # 如果返回 False，表示执行失败
-                    if run_result is False:
+                    elif run_result is False:
                         print("  [RUN] 执行失败")
-                        # 可配置：是否失败时停止
-                        if p.get('fail_stop', True):
+                        # 可配置：是否失败时停止（默认不中断，避免误停）
+                        if p.get('fail_stop', False):
                             break
                     else:
                         print(f"  [RUN] 执行成功")
@@ -573,7 +724,11 @@ def execute_steps(steps, run_context=None, status_callback=None):
             except MacroStopException:
                 raise  # 向上传播，不要吞掉
             except Exception as e:
-                print(f"  [执行异常] {e}"); import traceback; traceback.print_exc(); break
+                error_msg = f"  [执行异常] 步骤 {pc+1} ({act}): {e}"
+                print(error_msg); import traceback; traceback.print_exc()
+                if status_callback:
+                    status_callback(f"ERR {error_msg}")
+                break
             pc = next_pc
         
         return pc >= len(steps)
@@ -584,31 +739,38 @@ def execute_steps(steps, run_context=None, status_callback=None):
 def _handle_find(act, p, ctx, in_loop):
     is_img = 'IMAGE' in act
     final_engine = FORCE_OCR_ENGINE if (FORCE_OCR_ENGINE and FORCE_OCR_ENGINE != 'auto') else p.get('engine', 'auto')
+    sig = f"{act}_{p.get('path', p.get('text',''))}"
     
     region = None
-    if 'cache_box' in p:
-        cb = p['cache_box']
-        if isinstance(cb, list) and len(cb) == 2: cb = [cb[0], cb[1], cb[0], cb[1]]; p['cache_box'] = cb
-        if isinstance(cb, list) and len(cb) >= 4:
-            w_raw, h_raw = cb[2] - cb[0], cb[3] - cb[1]
-            if w_raw > 0 and h_raw > 0:
-                pad = CACHE_BOX_PADDING  # 使用常量替代魔法数字 
-                region = (max(0, cb[0]-pad), max(0, cb[1]-pad), w_raw+pad*2, h_raw+pad*2)
-            else:
-                if 'cache_box' in p: del p['cache_box']
-        else:
-            if 'cache_box' in p: del p['cache_box']
+    runtime_cache_boxes = ctx.setdefault('_runtime_cache_boxes', {})
+    cb_raw = runtime_cache_boxes.get(sig, p.get('cache_box'))
+    if cb_raw is not None:
+        if isinstance(cb_raw, (list, tuple)):
+            try:
+                cb = [int(v) for v in cb_raw]
+            except (TypeError, ValueError):
+                cb = []
+            if len(cb) == 2:
+                cb = [cb[0], cb[1], cb[0]+1, cb[1]+1]
+            if len(cb) >= 4:
+                w_raw, h_raw = cb[2] - cb[0], cb[3] - cb[1]
+                if w_raw > 0 and h_raw > 0:
+                    pad = CACHE_BOX_PADDING  # 使用常量替代魔法数字 
+                    region = (max(0, cb[0]-pad), max(0, cb[1]-pad), w_raw+pad*2, h_raw+pad*2)
 
     ss, offset = smart_screenshot(region)
-    sig = f"{act}_{p.get('path', p.get('text',''))}"
 
     # 增强模式：IF 动作和多缩放尝试（性能开销大，但更准确）
     enhanced_mode = ctx.get('enhanced_mode', False)
 
     if in_loop:
         cached = loop_cache.get(sig)
-        if cached and is_img and quick_check_cv2(p['path'], float(p.get('confidence',0.8)), ss, offset, cached, enhanced_mode):
-            perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
+        if cached and is_img:
+            confidence, ok = _safe_float(p.get('confidence', 0.8), 0.8, min_value=0, max_value=1)
+            if not ok:
+                _warn_param_default(act, 'confidence', confidence)
+            if quick_check_cv2(p.get('path',''), confidence, ss, offset, cached, enhanced_mode):
+                perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
 
     res = _do_find(is_img, p, ss, offset, final_engine, ctx)
 
@@ -620,7 +782,7 @@ def _handle_find(act, p, ctx, in_loop):
         res = _do_find(is_img, p, ss, offset, final_engine, ctx)
         if res:
             if len(res) >= 2:
-                p['cache_box'] = [res[0]-20, res[1]-10, res[0]+20, res[1]+10]
+                runtime_cache_boxes[sig] = [res[0]-20, res[1]-10, res[0]+20, res[1]+10]
 
     if res:
         pos = (res[0], res[1])
@@ -636,7 +798,10 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
     enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
     if is_img:
         # 图片查找返回: (cx, cy, w, h)
-        res_val = find_image_cv2(p['path'], float(p.get('confidence', 0.8)), ss, offset, enhanced_mode)
+        confidence, ok = _safe_float(p.get('confidence', 0.8), 0.8, min_value=0, max_value=1)
+        if not ok:
+            _warn_param_default('FIND_IMAGE', 'confidence', confidence)
+        res_val = find_image_cv2(p.get('path',''), confidence, ss, offset, enhanced_mode)
         if res_val:
             perf.record_hit(False, False)
             print(f"  [找到] 图 ({res_val[0][0]},{res_val[0][1]})")
@@ -644,7 +809,7 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
     else:
         # OCR 查找返回: ((cx, cy), full_text)
         res = ocr_engine.find_text_location(
-            p['text'], 
+            p.get('text',''), 
             p.get('lang','eng'), 
             p.get('debug',True), 
             ss, offset, engine, enhanced_mode
@@ -685,7 +850,10 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
                     try:
                         match = re.search(extract_pattern, text_content)
                         if match:
-                            final_text = match.group(0)
+                            if match.lastindex:
+                                final_text = match.group(1)
+                            else:
+                                final_text = match.group(0)
                             print(f"  [正则提取] '{final_text}'")
                         else:
                             print(f"  [正则] 未匹配，保留原文")
@@ -726,11 +894,12 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
         
         # 固定次数循环:检查剩余次数
         if mode == 'fixed':
-            # [补丁修复] 先检查后递减，确保计数正确
+            # [修复BUG-4] iteration 从初始化的 1 开始，每次回到 LOOP_START 时递增
             if top['remain'] > 0:
                 top['remain'] -= 1
                 top['iteration'] += 1
-                if cb: cb(f"循环第 {top['iteration']} 次 (剩余: {top['remain']}次)")
+                total = top.get('total_count', top['iteration'] + top['remain'])
+                if cb: cb(f"循环第 {top['iteration']} 次 (共 {total} 次)")
                 return pc + 1
             else:
                 loop_id_to_exit = loops.pop()['id']
@@ -745,14 +914,25 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
     # 新循环初始化
     else:
         mode = p.get('mode', 'fixed')
-        max_iter = int(p.get('max_iterations', 1000))
+        # [P2防御] 防止外部 JSON 中 max_iterations 为非数字字符串
+        try:
+            max_iter = int(p.get('max_iterations', 1000))
+        except (ValueError, TypeError):
+            print("  [警告] LOOP_START 参数 'max_iterations' 非法，已使用默认值 1000")
+            max_iter = 1000
         
         if mode == 'fixed':
-            count = int(p.get('times', 1))
+            # [P2防御] 防止外部 JSON 中 times 为非数字字符串
+            try:
+                count = int(p.get('times', 1))
+            except (ValueError, TypeError):
+                print("  [错误] LOOP_START 参数 'times' 必须是整数，循环已跳过")
+                return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
             if count <= 0:
                 return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
-            remain = count
+            remain = count - 1
         else:
+            count = max_iter  # 条件循环用 max_iter 作为参考
             remain = max_iter
         
         loop_id = f"L{pc}_{len(loops)}"
@@ -761,14 +941,18 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
             'remain': remain,
             'id': loop_id,
             'mode': mode,
-            'iteration': 0,
+            'iteration': 0 if mode in ('until_image', 'until_text') else 1,
+            'total_count': count,  # [修复BUG-4] 保存总次数，供状态显示
             'max_iterations': max_iter
         }
         
         # 保存条件参数
         if mode == 'until_image':
             loop_data['condition_image'] = p.get('condition_image', '')
-            loop_data['confidence'] = float(p.get('confidence', 0.8))
+            confidence, ok = _safe_float(p.get('confidence', 0.8), 0.8, min_value=0, max_value=1)
+            if not ok:
+                _warn_param_default('LOOP_START', 'confidence', confidence)
+            loop_data['confidence'] = confidence
             # [优化] 保存搜索区域，加速条件检测
             if 'cache_box' in p:
                 loop_data['cache_box'] = p['cache_box']
@@ -789,7 +973,7 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
         loop_cache.enter(loop_id)
         
         if mode == 'fixed':
-            if cb: cb(f"循环剩余: {remain}")
+            if cb: cb(f"循环第 1 次 (共 {count} 次)")
         else:
             if cb: cb(f"🔄 条件循环第 1 次 (最多 {max_iter} 次)")
         
@@ -842,9 +1026,13 @@ def _check_loop_condition(loop_data, ctx):
             if found:
                 print(f"  [Loop Until] OK 找到目标图像: {os.path.basename(path)}")
             return found
-        except Exception as e:
+        except (ValueError, TypeError, AttributeError, IndexError) + ((cv2.error,) if OPENCV_AVAILABLE else ()) as e:
             print(f"  [Loop Until] 图像检测错误: {e}")
             return False
+        except Exception as e:
+            print(f"  [Loop Until] 严重错误 (退出循环): {e}")
+            import traceback; traceback.print_exc()
+            return True
     
     elif mode == 'until_text':
         text = loop_data.get('condition_text', '')
@@ -864,22 +1052,45 @@ def _check_loop_condition(loop_data, ctx):
                 found_txt = text
                 if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], str):
                     found_txt = res[1]
-                found_txt = found_txt.encode('gbk', errors='replace').decode('gbk')
-                print(f"  [Loop Until] OK 找到目标文本: '{found_txt}'")
+                print(f"  [Loop Until] OK 找到目标文本: '{found_txt[:50]}'")
                 return True
             return False
-        except Exception as e:
-            error_msg = str(e).encode('gbk', errors='replace').decode('gbk')
-            print(f"  [Loop Until] 文本检测错误: {error_msg}")
+        except (ValueError, TypeError, AttributeError) as e:
+            print(f"  [Loop Until] 文本检测错误: {e}")
             return False
+        except Exception as e:
+            print(f"  [Loop Until] 严重错误 (退出循环): {e}")
+            import traceback; traceback.print_exc()
+            return True
     
     return False
 
-core_engine_version = f"1.6.2 (Core) / OpenCV: {OPENCV_AVAILABLE}"
+core_engine_version = f"1.7.0 Beta (Core) / OpenCV: {OPENCV_AVAILABLE}"
 
 # ======================================================================
 # RUN 处理函数：执行命令/脚本/文件
 # ======================================================================
+def _split_command_line(text):
+    """Split a command line without invoking a shell."""
+    text = str(text or '').strip()
+    if not text:
+        return []
+    if sys.platform == 'win32':
+        argc = ctypes.c_int()
+        argv = ctypes.windll.shell32.CommandLineToArgvW(text, ctypes.byref(argc))
+        if argv:
+            try:
+                return [argv[i] for i in range(argc.value)]
+            finally:
+                ctypes.windll.kernel32.LocalFree(argv)
+    return shlex.split(text, posix=(sys.platform != 'win32'))
+
+def _build_run_command(command, args):
+    cmd_list = _split_command_line(command)
+    if args:
+        cmd_list.extend(_split_command_line(args))
+    return cmd_list
+
 def _handle_run(p, ctx):
     """执行命令、脚本或写入文件
     
@@ -897,9 +1108,15 @@ def _handle_run(p, ctx):
         save_output: 保存输出到剪贴板
     
     返回:
-        True: 成功
-        False: 失败
+        bool | str:
+            True: 成功
+            False: 失败
+            'SKIPPED': 被策略跳过（例如 run_enabled=False）
     """
+    if not ctx.get('run_enabled', False):
+        print("  [RUN] 已跳过（执行外部命令默认已禁用，请在设置中手动开启）")
+        return 'SKIPPED'
+
     run_type = p.get('run_type', 'command')
     
     # === 文件写入模式 ===
@@ -939,22 +1156,43 @@ def _handle_run(p, ctx):
     elif run_type == 'command':
         command = p.get('command', '')
         args = p.get('args', '')
-        timeout = int(p.get('timeout', 30))
+        # [P2防御] 防止外部 JSON 中 timeout 为非数字字符串
+        try:
+            timeout = int(p.get('timeout', 30))
+            if timeout <= 0:
+                raise ValueError("timeout 必须大于 0")
+        except (ValueError, TypeError):
+            print("  [错误] RUN 参数 'timeout' 必须是正整数，已使用默认值 30")
+            timeout = 30
         cwd = p.get('cwd', None)
         save_output = p.get('save_output', False)
+        shell_mode = bool(p.get('shell_mode', False))
         
         if not command:
             print("  [RUN] 错误: 未指定命令")
             return False
         
-        full_cmd = f"{command} {args}" if args else command
+        if shell_mode:
+            print("  [RUN] 警告: 已启用 shell 模式，请仅运行可信宏")
+            run_cmd = f"{command} {args}" if args else command
+        else:
+            try:
+                run_cmd = _build_run_command(command, args)
+            except ValueError as e:
+                print(f"  [RUN] 命令参数解析失败: {e}")
+                return False
+            if not run_cmd:
+                print("  [RUN] 错误: 命令为空")
+                return False
         
         try:
             result = subprocess.run(
-                full_cmd,
-                shell=True,
+                run_cmd,
+                shell=shell_mode,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=timeout,
                 cwd=cwd if cwd else None
             )
@@ -964,7 +1202,7 @@ def _handle_run(p, ctx):
             if result.returncode == 0:
                 print(f"  [RUN] 命令执行成功")
                 if output:
-                    print(f"        输出: {output[:200]}")
+                    print(f"        输出: {_console_safe_text(output[:200])}")
                 if save_output and output:
                     ctx['clipboard_var'] = output
                     try:
@@ -976,7 +1214,7 @@ def _handle_run(p, ctx):
             else:
                 print(f"  [RUN] 命令执行失败 (退出码: {result.returncode})")
                 if output:
-                    print(f"        错误: {output[:200]}")
+                    print(f"        错误: {_console_safe_text(output[:200])}")
                 return False
                 
         except subprocess.TimeoutExpired:
@@ -991,7 +1229,14 @@ def _handle_run(p, ctx):
         script_path = p.get('script_path', '')
         interpreter = p.get('interpreter', 'python')
         args = p.get('args', '')
-        timeout = int(p.get('timeout', 30))
+        # [P2防御] script 模式同样防御 timeout 非法值
+        try:
+            timeout = int(p.get('timeout', 30))
+            if timeout <= 0:
+                raise ValueError("timeout 必须大于 0")
+        except (ValueError, TypeError):
+            print("  [错误] RUN 参数 'timeout' 必须是正整数，已使用默认值 30")
+            timeout = 30
         cwd = p.get('cwd', None)
         save_output = p.get('save_output', False)
         
@@ -1015,14 +1260,21 @@ def _handle_run(p, ctx):
         }
         cmd = INTERPRETERS.get(interpreter, interpreter)
         
-        full_cmd = f'{cmd} "{script_path}" {args}' if args else f'{cmd} "{script_path}"'
+        cmd_list = [cmd, script_path]
+        if args:
+            try:
+                cmd_list.extend(_split_command_line(args))
+            except ValueError:
+                cmd_list.append(args)
         
         try:
             result = subprocess.run(
-                full_cmd,
-                shell=True,
+                cmd_list,
+                shell=False,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=timeout,
                 cwd=cwd if cwd else None
             )
@@ -1032,7 +1284,7 @@ def _handle_run(p, ctx):
             if result.returncode == 0:
                 print(f"  [RUN] 脚本执行成功")
                 if output:
-                    print(f"        输出: {output[:200]}")
+                    print(f"        输出: {_console_safe_text(output[:200])}")
                 if save_output and output:
                     ctx['clipboard_var'] = output
                     try:
@@ -1044,7 +1296,7 @@ def _handle_run(p, ctx):
             else:
                 print(f"  [RUN] 脚本执行失败 (退出码: {result.returncode})")
                 if output:
-                    print(f"        错误: {output[:200]}")
+                    print(f"        错误: {_console_safe_text(output[:200])}")
                 return False
                 
         except subprocess.TimeoutExpired:

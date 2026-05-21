@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vlm_engine.py
 # 描述: 大模型视觉语言引擎 - 接入支持图片理解的大模型 API
-# 版本: 1.0.0
+# 版本: 1.1.0
 # 功能: 将屏幕截图转为 Base64，连同自然语言指令发送给 VLM API，返回坐标
 
 import base64
@@ -18,7 +18,7 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
-    print("[VLM] ✗ 未找到 requests 库 (pip install requests)")
+    print("[VLM] FAIL 未找到 requests 库 (pip install requests)")
 
 from PIL import Image, ImageGrab
 
@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     "system_prompt": "你是一个自动化助手。请分析用户指令和屏幕截图，返回目标位置的坐标。只返回 X, Y 坐标数字，用英文逗号分隔，例如: 123,456。如果找不到目标，返回: none"
 }
 
-    # 提供商配置
+# 提供商配置
 PROVIDER_CONFIGS = {
     "openai": {
         "name": "OpenAI (GPT-4o)",
@@ -73,6 +73,12 @@ PROVIDER_CONFIGS = {
         "name": "OpenRouter (聚合AI)",
         "base_url": "https://openrouter.ai/api/v1",
         "model": "google/gemma-3-4b-it:free",
+        "supports_vision": True
+    },
+    "step": {
+        "name": "阶跃星辰 (Step)",
+        "base_url": "https://api.stepfun.com/v1",
+        "model": "step-1v-8k",
         "supports_vision": True
     }
 }
@@ -113,12 +119,14 @@ def load_config():
                 for k, v in user_config.items():
                     if v:
                         default[k] = v
-                # 如果提供商变了，且用户没有自定义model，才使用提供商的默认model
+                user_has_base_url = bool(user_config.get('base_url'))
+                user_has_model = bool(user_config.get('model'))
+                # 如果提供商变了，只补用户未显式配置的 provider 默认值
                 if default['provider'] in PROVIDER_CONFIGS:
                     pc = PROVIDER_CONFIGS[default['provider']]
-                    default['base_url'] = pc.get('base_url', DEFAULT_CONFIG['base_url'])
-                    # 只有当model为空时才使用提供商的默认model
-                    if not default.get('model'):
+                    if not user_has_base_url:
+                        default['base_url'] = pc.get('base_url', DEFAULT_CONFIG['base_url'])
+                    if not user_has_model:
                         default['model'] = pc.get('model', DEFAULT_CONFIG['model'])
             except Exception as e:
                 print(f"[VLM] 加载配置失败: {e}")
@@ -128,16 +136,19 @@ def load_config():
 
 
 def save_config(config):
-    """保存 VLM 配置"""
+    """保存 VLM 配置（原子写入）"""
     global _vlm_config
-    try:
-        with open(VLM_CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        _vlm_config = config
-        return True
-    except Exception as e:
-        print(f"[VLM] 保存配置失败: {e}")
-        return False
+    with _vlm_lock:
+        try:
+            tmp_path = VLM_CONFIG_FILE + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, VLM_CONFIG_FILE)
+            _vlm_config = config
+            return True
+        except Exception as e:
+            print(f"[VLM] 保存配置失败: {e}")
+            return False
 
 
 def get_providers():
@@ -212,6 +223,8 @@ def parse_coordinates(response_text):
         r'x\s*[:=]\s*(\d+)\s*[,，]?\s*y\s*[:=]\s*(\d+)',  # x:123, y:456
         r'(\d+)\s*[,，]\s*(\d+).*(?:坐标|location)',  # 123,456 坐标
         r'位于\s*[（(]?\s*(\d+)\s*[,，]\s*(\d+)\s*[）)]?',  # 位于 (123,456)
+        r'(\d+)px?\s*[,，]\s*(\d+)px?',     # 带单位: 123px, 456px
+        r'^\s*(?:coordinate|position|location|point)?\s*[:：]?\s*(\d+)\s+(\d+)\s*$',  # 整段只有一个空格分隔坐标
     ]
     
     for pattern in patterns:
@@ -220,11 +233,10 @@ def parse_coordinates(response_text):
             try:
                 groups = match.groups()
                 if len(groups) == 4:
-                    # 4个坐标: x1,y1,x2,y2 -> 计算中心点
-                    x1, y1, x2, y4 = int(groups[0]), int(groups[1]), int(groups[2]), int(groups[3])
-                    if 0 <= x1 <= 10000 and 0 <= y1 <= 10000 and 0 <= x2 <= 10000 and 0 <= y4 <= 10000:
+                    x1, y1, x2, y2 = int(groups[0]), int(groups[1]), int(groups[2]), int(groups[3])
+                    if 0 <= x1 <= 10000 and 0 <= y1 <= 10000 and 0 <= x2 <= 10000 and 0 <= y2 <= 10000:
                         cx = (x1 + x2) // 2
-                        cy = (y1 + y4) // 2
+                        cy = (y1 + y2) // 2
                         return (cx, cy)
                 else:
                     # 2个坐标
@@ -256,13 +268,13 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
         (x, y) 坐标或 None
     """
     if not REQUESTS_AVAILABLE:
-        print("[VLM] ✗ requests 库不可用，无法调用 API")
+        print("[VLM] FAIL requests 库不可用，无法调用 API")
         return None
     
     cfg = config if config else load_config()
     
     if not cfg.get('api_key'):
-        print("[VLM] ✗ 未设置 API Key")
+        print("[VLM] FAIL 未设置 API Key")
         return None
     
     provider = cfg.get('provider', 'openai')
@@ -348,30 +360,43 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json"
         }
-        payload = {
-            "model": model,
-            "max_tokens": 100,
-            "system": system_prompt,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": instruction
-                        },
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_b64
+        if image_b64:
+            payload = {
+                "model": model,
+                "max_tokens": 100,
+                "system": system_prompt,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": instruction
+                            },
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": image_b64
+                                }
                             }
-                        }
-                    ]
-                }
-            ]
-        }
+                        ]
+                    }
+                ]
+            }
+        else:
+            payload = {
+                "model": model,
+                "max_tokens": 100,
+                "system": system_prompt,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": instruction
+                    }
+                ]
+            }
         url = f"{base_url}/messages"
         
     elif provider == "deepseek":
@@ -392,8 +417,10 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
                         "role": "user",
                         "content": [
                             {
-                                "type": "image",
-                                "image_url": f"data:image/jpeg;base64,{image_b64}"
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_b64}"
+                                }
                             },
                             {
                                 "type": "text",
@@ -460,6 +487,8 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
         url = f"{base_url}/chat/completions"
         
     elif provider == "qianwen":
+        # 使用 DashScope OpenAI 兼容模式端点 (compatible-mode/v1)
+        # 该端点完全兼容 OpenAI API 格式，使用标准 messages 结构
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
@@ -467,39 +496,43 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
         if image_b64:
             payload = {
                 "model": model,
-                "input": {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "image": f"data:image/jpeg;base64,{image_b64}"
-                                },
-                                {
-                                    "text": instruction
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_b64}"
                                 }
-                            ]
-                        }
-                    ]
-                },
-                "parameters": {
-                    "max_tokens": 100
-                }
+                            },
+                            {
+                                "type": "text",
+                                "text": instruction
+                            }
+                        ]
+                    }
+                ],
+                "max_tokens": 100
             }
         else:
             payload = {
                 "model": model,
-                "input": {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": instruction
-                        }
-                    ]
-                },
-                "parameters": {
-                    "max_tokens": 100
-                }
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": instruction
+                    }
+                ],
+                "max_tokens": 100
             }
         url = f"{base_url}/chat/completions"
         
@@ -508,27 +541,39 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_b64}"
+        if image_b64:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_b64}"
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": instruction
                             }
-                        },
-                        {
-                            "type": "text",
-                            "text": instruction
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 100
-        }
+                        ]
+                    }
+                ],
+                "max_tokens": 100
+            }
+        else:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": instruction
+                    }
+                ],
+                "max_tokens": 100
+            }
         url = f"{base_url}/chat/completions"
         
     elif provider == "openrouter":
@@ -583,7 +628,7 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
         url = f"{base_url}/chat/completions"
     
     else:
-        print(f"[VLM] ✗ 不支持的提供商: {provider}")
+        print(f"[VLM] FAIL 不支持的提供商: {provider}")
         return None
     
     # 发送请求
@@ -593,7 +638,10 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
         elapsed = time.time() - t0
         
         if response.status_code != 200:
-            print(f"[VLM] API 返回错误: {response.status_code} - {response.text}")
+            error_text = (response.text or '').replace('\r', ' ').replace('\n', ' ')
+            if len(error_text) > 1000:
+                error_text = error_text[:1000] + "...(truncated)"
+            print(f"[VLM] API 返回错误: {response.status_code} - {error_text}")
             return None
         
         # 解析响应
@@ -601,7 +649,7 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
         
         # 提取文本
         text_content = ""
-        if provider in ("openai", "deepseek", "qianwen", "openrouter"):
+        if provider in ("openai", "deepseek", "qianwen", "openrouter", "step"):
             choices = result.get('choices', [])
             if choices:
                 msg = choices[0].get('message', {})
@@ -629,10 +677,10 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None):
         return coords
         
     except requests.Timeout:
-        print(f"[VLM] ✗ 请求超时 ({timeout}s)")
+        print(f"[VLM] FAIL 请求超时 ({timeout}s)")
         return None
     except Exception as e:
-        print(f"[VLM] ✗ 请求失败: {e}")
+        print(f"[VLM] FAIL 请求失败: {e}")
         return None
 
 
@@ -677,7 +725,7 @@ def test_vlm():
     
     # 测试截图
     print("[VLM] 测试截图...")
-    b64 = capture_screen()
+    b64, offset = capture_screen()
     if b64:
         print(f"[VLM] 截图成功, Base64 长度: {len(b64)}")
     
@@ -690,4 +738,4 @@ def test_vlm():
         print("[VLM] 未找到坐标")
 
 
-vlm_engine_version = "1.0.0"
+vlm_engine_version = "1.1.0"
