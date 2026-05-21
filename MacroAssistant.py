@@ -3,7 +3,6 @@
 # 描述: 自动化宏的 GUI 界面
 # 版本: 1.7.0
 # 变更: 迁移部分代码至sys_utils.py和gui_utils.py,并修复一些小bug和优化了代码结构
-        
 
 # 使用: 
 #   - GUI 模式: python MacroAssistant.py
@@ -499,6 +498,7 @@ class MacroApp:
         
         # 创建关于对话框
         about_dialog = tk.Toplevel(self.root)
+        about_dialog.withdraw()  # 立即隐藏，防止闪烁
         self._about_dialog_ref = about_dialog
         about_dialog.title("关于")
         about_dialog.geometry("500x400")  # 足够宽度显示完整链接
@@ -534,6 +534,7 @@ class MacroApp:
         y = main_y + (main_height - dialog_height) // 2
         
         about_dialog.geometry(f"+{x}+{y}")
+        about_dialog.deiconify()  # 位置确定后再显示
         
         # 主框架 - 减小内边距
         main_frame = ttk.Frame(about_dialog, padding=20)

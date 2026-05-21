@@ -447,6 +447,7 @@ class HotkeySettingsDialog:
         self.result = None
 
         self.dialog = tk.Toplevel(parent)
+        self.dialog.withdraw()  # 立即隐藏，防止闪烁
         self.dialog.title("快捷键设置")
         self.dialog.geometry("450x480")
         self.dialog.resizable(False, False)
@@ -457,6 +458,7 @@ class HotkeySettingsDialog:
         x = parent.winfo_x() + (parent.winfo_width() - self.dialog.winfo_width()) // 2
         y = parent.winfo_y() + (parent.winfo_height() - self.dialog.winfo_height()) // 2
         self.dialog.geometry(f"+{x}+{y}")
+        self.dialog.deiconify()  # 位置确定后再显示
 
         self._create_ui(run_hotkey, stop_hotkey)
         self.dialog.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -569,6 +571,7 @@ class VLMSettingsDialog:
         self.font_ui = ("Microsoft YaHei UI", 10)
 
         self.dialog = tk.Toplevel(parent)
+        self.dialog.withdraw()  # 立即隐藏，防止闪烁
         self.dialog.title("🤖 AI 配置设置")
         self.dialog.geometry("520x660")
         self.dialog.resizable(False, False)
@@ -578,6 +581,7 @@ class VLMSettingsDialog:
         x = parent.winfo_x() + (parent.winfo_width() - self.dialog.winfo_width()) // 2
         y = parent.winfo_y() + (parent.winfo_height() - self.dialog.winfo_height()) // 2
         self.dialog.geometry(f"+{x}+{y}")
+        self.dialog.deiconify()  # 位置确定后再显示
 
         self._create_ui()
 
