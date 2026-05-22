@@ -1,6 +1,6 @@
 # gui_utils.py
 # 描述：GUI 组件工厂与界面逻辑处理 (重构版)
-# 版本：1.7.0
+# 版本：1.7.1
 
 import sys
 import tkinter as tk
@@ -38,11 +38,13 @@ class AutoWrapLabel(ttk.Label):
         if 'wraplength' not in kwargs:
             kwargs['wraplength'] = 250
         super().__init__(master, **kwargs)
+        self._last_width = None
         self.bind('<Configure>', self._on_configure)
 
     def _on_configure(self, event):
         width = event.width - 15
-        if width > 0:
+        if width > 0 and (self._last_width is None or abs(width - self._last_width) > 5):
+            self._last_width = width
             self.configure(wraplength=width)
 
 
@@ -438,7 +440,11 @@ class ParamWidgetFactory:
                 elif k == 'region':
                     if val.strip():
                         coords = parse_region_string(val)
-                        if coords: params['cache_box'] = coords
+                        if not coords:
+                            return None, "参数 'region' 格式无效，应为 x1, y1, x2, y2"
+                        if coords[2] <= coords[0] or coords[3] <= coords[1]:
+                            return None, "参数 'region' 必须满足 x2 > x1 且 y2 > y1"
+                        params['region'] = coords
                 elif k == 'extract_pattern':
                     if val and val.strip(): params[k] = val.strip()
                 else:
@@ -478,9 +484,9 @@ class ParamWidgetFactory:
                 if mode == 'fixed':
                     keep_keys = ['mode', 'times']
                 elif mode == 'until_image':
-                    keep_keys = ['mode', 'condition_image', 'confidence', 'max_iterations', 'cache_box']
+                    keep_keys = ['mode', 'condition_image', 'confidence', 'max_iterations', 'region']
                 elif mode == 'until_text':
-                    keep_keys = ['mode', 'condition_text', 'lang', 'max_iterations', 'cache_box']
+                    keep_keys = ['mode', 'condition_text', 'lang', 'max_iterations', 'region']
                 else:
                     keep_keys = ['mode', 'times']
 

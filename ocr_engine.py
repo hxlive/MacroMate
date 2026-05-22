@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ocr_engine.py
 # 描述:自动化宏的 OCR 功能引擎
-# 版本:1.7.0
+# 版本:1.7.1
 # 变更:(终极修复) 返回完整识别文本,支持剪贴板功能
 
 from PIL import Image, ImageGrab
@@ -158,76 +158,109 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
     if not target_text or not isinstance(target_text, str): return None
     target_norm = re.sub(r'\s+', '', target_text).lower()
     if not target_norm: return None
-    if screenshot_pil is None: screenshot_pil = ImageGrab.grab(); offset = (0, 0)
-    
-    img_bgr_cache = None 
+    _should_close_screenshot = False
+    if screenshot_pil is None:
+        try:
+            if sys.platform == 'win32':
+                import ctypes
+                SM_XVIRTUALSCREEN = 76
+                SM_YVIRTUALSCREEN = 77
+                SM_CXVIRTUALSCREEN = 78
+                SM_CYVIRTUALSCREEN = 79
+                user32 = ctypes.windll.user32
+                vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+                vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+                vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+                vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+                primary_w = user32.GetSystemMetrics(0)
+                primary_h = user32.GetSystemMetrics(1)
+                if vw > 0 and vh > 0 and (vx != 0 or vy != 0 or vw > primary_w or vh > primary_h):
+                    screenshot_pil = ImageGrab.grab(all_screens=True)
+                    offset = (vx, vy)
+                else:
+                    screenshot_pil = ImageGrab.grab()
+                    offset = (0, 0)
+            else:
+                screenshot_pil = ImageGrab.grab()
+                offset = (0, 0)
+            _should_close_screenshot = True
+        except OSError as e:
+            print(f"  [OCR] 截图失败 (锁屏或无显示器): {e}")
+            return None
 
-    def get_img_bgr():
-        nonlocal img_bgr_cache
-        if img_bgr_cache is None:
+    try:
+        img_bgr_cache = None 
+
+        def get_img_bgr():
+            nonlocal img_bgr_cache
+            if img_bgr_cache is None:
+                try:
+                    img_bgr_cache = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    print(f"  [OCR] 截图转换失败: {e}")
+                    return None
+            return img_bgr_cache
+
+        if engine == 'auto':
+            # 尝试 WinOCR
             try:
-                img_bgr_cache = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2BGR)
-            except Exception as e:
-                print(f"  [OCR] 截图转换失败: {e}")
-                return None
-        return img_bgr_cache
-
-    if engine == 'auto':
-        # 尝试 WinOCR
-        try:
-            import winocr
-            if lang in LANG_MAP['winocr']:
+                import winocr
+                if lang in LANG_MAP['winocr']:
+                    t0 = time.time()
+                    result = _find_text_winocr(winocr, target_norm, LANG_MAP['winocr'][lang], debug, screenshot_pil, offset)
+                    ocr_stats.record('winocr', result is not None, time.time() - t0)
+                    if result: return result  # 返回 ((x,y), full_text)
+            except ImportError: pass
+            
+            # 尝试 RapidOCR
+            rapid_inst = get_rapid_ocr_engine()
+            img_bgr = get_img_bgr()
+            if rapid_inst and img_bgr is not None and lang in LANG_MAP['rapidocr']:
                 t0 = time.time()
-                result = _find_text_winocr(winocr, target_norm, LANG_MAP['winocr'][lang], debug, screenshot_pil, offset)
-                ocr_stats.record('winocr', result is not None, time.time() - t0)
-                if result: return result  # 返回 ((x,y), full_text)
-        except ImportError: pass
-        
-        # 尝试 RapidOCR
-        rapid_inst = get_rapid_ocr_engine()
-        img_bgr = get_img_bgr()
-        if rapid_inst and img_bgr is not None and lang in LANG_MAP['rapidocr']:
-            t0 = time.time()
-            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, img_bgr, offset, enhanced_mode)
-            ocr_stats.record('rapidocr', result is not None, time.time() - t0)
-            if result: return result
-
-        # 尝试 Tesseract
-        if get_tesseract_cmd() and lang in LANG_MAP['tesseract']:
-            t0 = time.time()
-            result = _find_text_tesseract(target_norm, LANG_MAP['tesseract'][lang], debug, screenshot_pil, offset, enhanced_mode)
-            ocr_stats.record('tesseract', result is not None, time.time() - t0)
-            if result: return result
-
-    elif engine == 'rapidocr':
-        rapid_inst = get_rapid_ocr_engine()
-        img_bgr = get_img_bgr()
-        if rapid_inst and img_bgr is not None and lang in LANG_MAP['rapidocr']:
-            t0 = time.time()
-            result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, img_bgr, offset, enhanced_mode)
-            ocr_stats.record('rapidocr', result is not None, time.time() - t0)
-            if result: return result
-
-    elif engine == 'winocr':
-        try:
-            import winocr
-            if lang in LANG_MAP['winocr']:
-                t0 = time.time()
-                result = _find_text_winocr(winocr, target_norm, LANG_MAP['winocr'][lang], debug, screenshot_pil, offset)
-                ocr_stats.record('winocr', result is not None, time.time() - t0)
+                result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, img_bgr, offset, enhanced_mode)
+                ocr_stats.record('rapidocr', result is not None, time.time() - t0)
                 if result: return result
-        except ImportError: pass
 
-    elif engine == 'tesseract':
-        if get_tesseract_cmd() and lang in LANG_MAP['tesseract']:
-            t0 = time.time()
-            result = _find_text_tesseract(target_norm, LANG_MAP['tesseract'][lang], debug, screenshot_pil, offset, enhanced_mode)
-            ocr_stats.record('tesseract', result is not None, time.time() - t0)
-            if result: return result
+            # 尝试 Tesseract
+            if get_tesseract_cmd() and lang in LANG_MAP['tesseract']:
+                t0 = time.time()
+                result = _find_text_tesseract(target_norm, LANG_MAP['tesseract'][lang], debug, screenshot_pil, offset, enhanced_mode)
+                ocr_stats.record('tesseract', result is not None, time.time() - t0)
+                if result: return result
 
-    print(f"  [失败] 未能找到 '{target_text}' (模式: {engine})")
-    if debug: print(f"  [统计] {ocr_stats.get_stats()}")
-    return None
+        elif engine == 'rapidocr':
+            rapid_inst = get_rapid_ocr_engine()
+            img_bgr = get_img_bgr()
+            if rapid_inst and img_bgr is not None and lang in LANG_MAP['rapidocr']:
+                t0 = time.time()
+                result = _find_text_rapidocr_internal(rapid_inst, target_norm, debug, img_bgr, offset, enhanced_mode)
+                ocr_stats.record('rapidocr', result is not None, time.time() - t0)
+                if result: return result
+
+        elif engine == 'winocr':
+            try:
+                import winocr
+                if lang in LANG_MAP['winocr']:
+                    t0 = time.time()
+                    result = _find_text_winocr(winocr, target_norm, LANG_MAP['winocr'][lang], debug, screenshot_pil, offset)
+                    ocr_stats.record('winocr', result is not None, time.time() - t0)
+                    if result: return result
+            except ImportError: pass
+
+        elif engine == 'tesseract':
+            if get_tesseract_cmd() and lang in LANG_MAP['tesseract']:
+                t0 = time.time()
+                result = _find_text_tesseract(target_norm, LANG_MAP['tesseract'][lang], debug, screenshot_pil, offset, enhanced_mode)
+                ocr_stats.record('tesseract', result is not None, time.time() - t0)
+                if result: return result
+
+        print(f"  [失败] 未能找到 '{target_text}' (模式: {engine})")
+        if debug: print(f"  [统计] {ocr_stats.get_stats()}")
+        return None
+    finally:
+        if _should_close_screenshot and screenshot_pil:
+            try: screenshot_pil.close()
+            except Exception: pass
 
 # --- 具体实现函数 (修改为返回完整文本) ---
 def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_pil, offset):
@@ -427,6 +460,13 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset, enhan
     except Exception as e: 
         if debug: print(f"[Tesseract Error] {e}")
         return None
+    finally:
+        if 'img_processed' in locals() and img_processed:
+            try: img_processed.close()
+            except Exception: pass
+        if 'g' in locals() and g and g is not screenshot_pil:
+            try: g.close()
+            except Exception: pass
 
 def get_available_engines():
     engines = []
@@ -449,4 +489,4 @@ def get_available_engines():
         
     return engines
 
-ocr_engine_version = "1.7.0"
+ocr_engine_version = "1.7.1"

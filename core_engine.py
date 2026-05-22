@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
 # 描述:自动化宏的核心功能引擎
-# 版本:1.7.0
+# 版本:1.7.1
 # # 变更:(修复) 新增 MacroStopException，实现快捷键即时中断
 
 # ======================================================================
@@ -11,6 +11,14 @@ class MacroStopException(BaseException):
     """快捷键触发时注入到执行线程的异常，强制立刻中断宏。
     继承 BaseException 而非 Exception，确保不被 except Exception 误吞。
     """
+    pass
+
+class LoopConditionCheckError(RuntimeError):
+    """Raised when a loop exit condition cannot be checked safely."""
+    pass
+
+class ScreenshotUnavailableError(RuntimeError):
+    """Raised when the desktop cannot be captured."""
     pass
 
 import pyautogui
@@ -25,6 +33,7 @@ import subprocess
 import shlex
 import ctypes
 import functools
+import threading
 
 if sys.platform == 'win32':
     ctypes.windll.shell32.CommandLineToArgvW.argtypes = (ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int))
@@ -311,12 +320,110 @@ def _console_safe_text(value):
     encoding = getattr(sys.stdout, 'encoding', None) or 'utf-8'
     return text.encode(encoding, errors='replace').decode(encoding, errors='replace')
 
+def _coerce_bbox(raw_bbox):
+    if not isinstance(raw_bbox, (list, tuple)):
+        return None
+    try:
+        bbox = [int(value) for value in raw_bbox]
+    except (TypeError, ValueError):
+        return None
+    if len(bbox) == 2:
+        bbox = [bbox[0], bbox[1], bbox[0] + 1, bbox[1] + 1]
+    if len(bbox) < 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        return None
+    return bbox[:4]
+
+def bbox_to_region(raw_bbox):
+    """Convert an (x1, y1, x2, y2) box into a screenshot region."""
+    bbox = _coerce_bbox(raw_bbox)
+    if not bbox:
+        return None
+    return (bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1])
+
+def _padded_bbox_to_region(raw_bbox, pad):
+    bbox = _coerce_bbox(raw_bbox)
+    if not bbox:
+        return None
+    left = bbox[0] - pad
+    top = bbox[1] - pad
+    if sys.platform != 'win32':
+        left = max(0, left)
+        top = max(0, top)
+    right = bbox[2] + pad
+    bottom = bbox[3] + pad
+    return (left, top, right - left, bottom - top)
+
+def _copy_to_clipboard_with_retry(text, ctx=None, retries=3, delay=0.2):
+    for _ in range(retries):
+        if ctx and ctx.get('stop_requested'):
+            raise MacroStopException("Stop requested while writing to clipboard")
+        try:
+            pyperclip.copy(text)
+            return True
+        except Exception:
+            time.sleep(delay)
+    return False
+
 def smart_screenshot(region=None, pad=0):
-    if region:
-        x = max(0, region[0] - pad)
-        y = max(0, region[1] - pad)
-        return ImageGrab.grab(bbox=(x, y, region[0]+region[2]+pad, region[1]+region[3]+pad)), (x, y)
-    return ImageGrab.grab(), (0, 0)
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            SM_XVIRTUALSCREEN = 76
+            SM_YVIRTUALSCREEN = 77
+            SM_CXVIRTUALSCREEN = 78
+            SM_CYVIRTUALSCREEN = 79
+            user32 = ctypes.windll.user32
+            vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            
+            if region:
+                x1 = region[0] - pad
+                y1 = region[1] - pad
+                x2 = region[0] + region[2] + pad
+                y2 = region[1] + region[3] + pad
+                
+                # 针对多屏幕或跨主屏坐标，采用 all_screens 抓取并裁剪
+                screen_w = user32.GetSystemMetrics(0)
+                screen_h = user32.GetSystemMetrics(1)
+                if x1 < 0 or y1 < 0 or x2 > screen_w or y2 > screen_h or vx < 0 or vy < 0:
+                    full_screen = ImageGrab.grab(all_screens=True)
+                    try:
+                        crop_box = (x1 - vx, y1 - vy, x2 - vx, y2 - vy)
+                        # 确保不越界并精确计算钳位后的偏移量
+                        cx1 = max(0, crop_box[0])
+                        cy1 = max(0, crop_box[1])
+                        cx2 = min(full_screen.width, crop_box[2])
+                        cy2 = min(full_screen.height, crop_box[3])
+                        
+                        crop_box = (cx1, cy1, cx2, cy2)
+                        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+                            raise ValueError("Invalid crop box geometry")
+                        cropped_img = full_screen.crop(crop_box)
+                        full_screen.close()
+                        # 使用 clamp 限制后的值反向修正物理绝对坐标作为 offset
+                        return cropped_img, (cx1 + vx, cy1 + vy)
+                    except Exception as e:
+                        try: full_screen.close()
+                        except Exception: pass
+                        raise e
+                
+                return ImageGrab.grab(bbox=(x1, y1, x2, y2)), (x1, y1)
+            else:
+                primary_w = user32.GetSystemMetrics(0)
+                primary_h = user32.GetSystemMetrics(1)
+                if vw > 0 and vh > 0 and (vx != 0 or vy != 0 or vw > primary_w or vh > primary_h):
+                    return ImageGrab.grab(all_screens=True), (vx, vy)
+                return ImageGrab.grab(), (0, 0)
+        else:
+            if region:
+                x = max(0, region[0] - pad)
+                y = max(0, region[1] - pad)
+                return ImageGrab.grab(bbox=(x, y, region[0]+region[2]+pad, region[1]+region[3]+pad)), (x, y)
+            return ImageGrab.grab(), (0, 0)
+    except OSError as e:
+        raise ScreenshotUnavailableError("Screen capture is unavailable") from e
 
 SCALES = (1.0, 0.9, 1.1, 0.8, 1.2)
 @functools.lru_cache(maxsize=TEMPLATE_CACHE_SIZE)  # [优化] 增大缓存以减少文件读取
@@ -400,13 +507,15 @@ def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc, enhanced_mod
 # 主执行引擎
 # ======================================================================
 def execute_steps(steps, run_context=None, status_callback=None):
-    print(f"\n--- 宏执行开始 (Core V1.7.0 Beta) ---")
+    print(f"\n--- 执行开始 (Core V1.7.1 Beta) ---")
     perf.reset(); loop_cache.reset()
     _get_template.cache_clear()
     ctx = run_context if run_context else {}
     ctx.setdefault('last_pos', (None, None))
     ctx.setdefault('stop_requested', False)
     ctx.setdefault('clipboard_var', '')
+    ctx.setdefault('_active_processes', set())
+    ctx.setdefault('_active_process_lock', threading.RLock())
     
     default_stop = "Ctrl+F11"
     try:
@@ -465,10 +574,15 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     
                     # 获取可选的区域参数
                     region = None
-                    if 'cache_box' in p:
-                        cb = p['cache_box']
-                        if isinstance(cb, list) and len(cb) >= 4:
-                            region = tuple(cb)
+                    if p.get('region') is not None:
+                        bbox = _coerce_bbox(p.get('region'))
+                        if bbox is None:
+                            raise ValueError(f"AI 手动区域解析失败(格式错误): {p.get('region')}")
+                        region = tuple(bbox)
+                    elif p.get('cache_box') is not None:
+                        bbox = _coerce_bbox(p.get('cache_box'))
+                        if bbox:
+                            region = tuple(bbox)
                     
                     print(f"  [AI] 执行指令: {instruction}")
                     
@@ -591,17 +705,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         print(f"  [输入] 替换占位符: {text}")
                     
                     if interval > 0: pyautogui.write(text, interval=interval)
-                    else: 
-                        copy_success = False
-                        for _retry in range(3):
-                            if ctx.get('stop_requested'):
-                                raise MacroStopException("用户在输入期间请求停止")
-                            try:
-                                pyperclip.copy(text)
-                                copy_success = True
-                                break
-                            except Exception:
-                                time.sleep(0.2)
+                    else:
+                        copy_success = _copy_to_clipboard_with_retry(text, ctx)
                         
                         if copy_success:
                             time.sleep(0.1)
@@ -615,18 +720,23 @@ def execute_steps(steps, run_context=None, status_callback=None):
                 
                 elif act == 'ACTIVATE_WINDOW':
                     if not PYGETWINDOW_AVAILABLE:
-                        print("  [错误] pygetwindow 库未安装,无法激活窗口。")
-                        break
+                        msg = "pygetwindow is unavailable; cannot activate target window"
+                        if p.get('ignore_fail', False):
+                            print(f"  [WARN] {msg}")
+                            pc = next_pc; continue
+                        raise RuntimeError(msg)
                     title = p.get('title')
                     if not title:
-                        print("  [错误] 未提供窗口标题。")
-                        break
+                        msg = "ACTIVATE_WINDOW is missing a window title"
+                        if p.get('ignore_fail', False):
+                            print(f"  [WARN] {msg}")
+                            pc = next_pc; continue
+                        raise RuntimeError(msg)
                     
                     try:
                         wins = gw.getWindowsWithTitle(title)
                         if not wins:
-                            print(f"  [失败] 未找到标题包含 '{title}' 的窗口。")
-                            break
+                            raise RuntimeError(f"No window title contains '{title}'")
                         
                         target_win = wins[0]
                         if target_win.isMinimized:
@@ -638,8 +748,10 @@ def execute_steps(steps, run_context=None, status_callback=None):
                                 raise MacroStopException("用户在窗口激活期间请求停止")
                             time.sleep(0.1) 
                     except Exception as e:
-                        print(f"  [错误] 激活窗口时出错: {e}")
-                        break
+                        if p.get('ignore_fail', False):
+                            print(f"  [WARN] ACTIVATE_WINDOW failed and was ignored: {e}")
+                            pc = next_pc; continue
+                        raise RuntimeError(f"ACTIVATE_WINDOW failed: {e}") from e
                 
                 elif act == 'NOTE':
                     # 备注动作 - 仅打印注释，不执行任何操作
@@ -721,6 +833,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         print("[错误] END_LOOP 缺少对应的 LOOP_START")
                         next_pc = pc + 1  # 继续执行下一步
 
+            except pyautogui.FailSafeException as e:
+                raise MacroStopException("PyAutoGUI failsafe triggered") from e
             except MacroStopException:
                 raise  # 向上传播，不要吞掉
             except Exception as e:
@@ -733,6 +847,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
         
         return pc >= len(steps)
     finally:
+        cleanup_active_processes(ctx)
         loop_cache.reset()
         print(f"--- 执行结束 ---\n[统计] {perf.get_stats()}\n")
 
@@ -742,56 +857,63 @@ def _handle_find(act, p, ctx, in_loop):
     sig = f"{act}_{p.get('path', p.get('text',''))}"
     
     region = None
+    is_manual_region = False
     runtime_cache_boxes = ctx.setdefault('_runtime_cache_boxes', {})
-    cb_raw = runtime_cache_boxes.get(sig, p.get('cache_box'))
-    if cb_raw is not None:
-        if isinstance(cb_raw, (list, tuple)):
-            try:
-                cb = [int(v) for v in cb_raw]
-            except (TypeError, ValueError):
-                cb = []
-            if len(cb) == 2:
-                cb = [cb[0], cb[1], cb[0]+1, cb[1]+1]
-            if len(cb) >= 4:
-                w_raw, h_raw = cb[2] - cb[0], cb[3] - cb[1]
-                if w_raw > 0 and h_raw > 0:
-                    pad = CACHE_BOX_PADDING  # 使用常量替代魔法数字 
-                    region = (max(0, cb[0]-pad), max(0, cb[1]-pad), w_raw+pad*2, h_raw+pad*2)
+    if p.get('region') is not None:
+        region = bbox_to_region(p.get('region'))
+        if region is None:
+            raise ValueError(f"手动查找区域解析失败(格式错误): {p.get('region')}")
+        is_manual_region = True
+    if not region:
+        cb_raw = runtime_cache_boxes.get(sig, p.get('cache_box'))
+        region = _padded_bbox_to_region(cb_raw, CACHE_BOX_PADDING)
 
-    ss, offset = smart_screenshot(region)
+    # 引入 try...finally 结构以保证 ss 得到显式释放
+    ss = None
+    try:
+        ss, offset = smart_screenshot(region)
 
-    # 增强模式：IF 动作和多缩放尝试（性能开销大，但更准确）
-    enhanced_mode = ctx.get('enhanced_mode', False)
+        # 增强模式：IF 动作和多缩放尝试（性能开销大，但更准确）
+        enhanced_mode = ctx.get('enhanced_mode', False)
 
-    if in_loop:
-        cached = loop_cache.get(sig)
-        if cached and is_img:
-            confidence, ok = _safe_float(p.get('confidence', 0.8), 0.8, min_value=0, max_value=1)
-            if not ok:
-                _warn_param_default(act, 'confidence', confidence)
-            if quick_check_cv2(p.get('path',''), confidence, ss, offset, cached, enhanced_mode):
-                perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
+        if in_loop:
+            cached = loop_cache.get(sig)
+            if cached and is_img:
+                confidence, ok = _safe_float(p.get('confidence', 0.8), 0.8, min_value=0, max_value=1)
+                if not ok:
+                    _warn_param_default(act, 'confidence', confidence)
+                if quick_check_cv2(p.get('path',''), confidence, ss, offset, cached, enhanced_mode):
+                    perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
 
-    res = _do_find(is_img, p, ss, offset, final_engine, ctx)
-
-    # IF 动作不使用全局 fallback（会大幅降低性能，因为它已经重复搜索了）
-    # FIND_TEXT/FIND_IMAGE 才使用 fallback
-    if not res and region and ENABLE_GLOBAL_FALLBACK and enhanced_mode and not act.startswith('IF_'):
-        print("  [缓存失效] 全局搜索...")
-        ss, offset = smart_screenshot(None)
         res = _do_find(is_img, p, ss, offset, final_engine, ctx)
+
+        # IF 动作不使用全局 fallback（会大幅降低性能，因为它已经重复搜索了）
+        # FIND_TEXT/FIND_IMAGE 才使用 fallback
+        if not res and region and ENABLE_GLOBAL_FALLBACK and enhanced_mode and not act.startswith('IF_') and not is_manual_region:
+            print("  [缓存失效] 全局搜索...")
+            # 释放旧的 ss，防止覆盖导致句柄丢失泄漏
+            if ss:
+                try: ss.close()
+                except Exception: pass
+                ss = None
+            ss, offset = smart_screenshot(None)
+            res = _do_find(is_img, p, ss, offset, final_engine, ctx)
+            if res:
+                if len(res) >= 2:
+                    runtime_cache_boxes[sig] = [res[0]-20, res[1]-10, res[0]+20, res[1]+10]
+
         if res:
-            if len(res) >= 2:
-                runtime_cache_boxes[sig] = [res[0]-20, res[1]-10, res[0]+20, res[1]+10]
+            pos = (res[0], res[1])
+            if in_loop: loop_cache.set(sig, pos)
+            ctx['last_pos'] = pos
+            return res
 
-    if res:
-        pos = (res[0], res[1])
-        if in_loop: loop_cache.set(sig, pos)
-        ctx['last_pos'] = pos
-        return res
-
-    perf.record_miss(not is_img)
-    return None
+        perf.record_miss(not is_img)
+        return None
+    finally:
+        if ss:
+            try: ss.close()
+            except Exception: pass
 
 def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
     """执行查找（图像或文本）并返回统一格式坐标 (x, y)"""
@@ -862,7 +984,8 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
                 
                 ctx['clipboard_var'] = final_text
                 try:
-                    pyperclip.copy(final_text)
+                    if not _copy_to_clipboard_with_retry(final_text, ctx):
+                        raise RuntimeError("clipboard is busy")
                     print(f"  [剪贴板] OK 已复制")
                 except Exception as e:
                     print(f"  [剪贴板] 失败: {e}")
@@ -945,6 +1068,8 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
             'total_count': count,  # [修复BUG-4] 保存总次数，供状态显示
             'max_iterations': max_iter
         }
+        if p.get('region') is not None:
+            loop_data['region'] = p['region']
         
         # 保存条件参数
         if mode == 'until_image':
@@ -954,7 +1079,9 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
                 _warn_param_default('LOOP_START', 'confidence', confidence)
             loop_data['confidence'] = confidence
             # [优化] 保存搜索区域，加速条件检测
-            if 'cache_box' in p:
+            if 'region' in p:
+                print(f"  [Loop Until Image] 目标: {loop_data['condition_image']} (区域: {p['region']})")
+            elif 'cache_box' in p:
                 loop_data['cache_box'] = p['cache_box']
                 print(f"  [Loop Until Image] 目标: {loop_data['condition_image']} (区域: {p['cache_box']})")
             else:
@@ -963,7 +1090,9 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
             loop_data['condition_text'] = p.get('condition_text', '')
             loop_data['lang'] = p.get('lang', 'eng')
             # [优化] 保存搜索区域，加速条件检测
-            if 'cache_box' in p:
+            if 'region' in p:
+                print(f"  [Loop Until Text] 目标: {loop_data['condition_text']} (区域: {p['region']})")
+            elif 'cache_box' in p:
                 loop_data['cache_box'] = p['cache_box']
                 print(f"  [Loop Until Text] 目标: {loop_data['condition_text']} (区域: {p['cache_box']})")
             else:
@@ -1001,13 +1130,12 @@ def _check_loop_condition(loop_data, ctx):
     
     # [优化] 统一构建截图区域（支持 cache_box 缩小截图范围）
     def _build_region(ld):
-        cb = ld.get('cache_box')
-        if cb and isinstance(cb, list) and len(cb) >= 4:
-            w_raw, h_raw = cb[2] - cb[0], cb[3] - cb[1]
-            if w_raw > 0 and h_raw > 0:
-                pad = CACHE_BOX_PADDING
-                return (max(0, cb[0]-pad), max(0, cb[1]-pad), w_raw+pad*2, h_raw+pad*2)
-        return None
+        if ld.get('region') is not None:
+            region = bbox_to_region(ld.get('region'))
+            if region is None:
+                raise LoopConditionCheckError(f"Loop region is invalid: {ld.get('region')}")
+            return region
+        return _padded_bbox_to_region(ld.get('cache_box'), CACHE_BOX_PADDING)
 
     if mode == 'until_image':
         path = loop_data.get('condition_image', '')
@@ -1017,6 +1145,7 @@ def _check_loop_condition(loop_data, ctx):
             print(f"  [Loop Until] 警告: 图像路径无效 '{path}'")
             return False
         
+        ss = None
         try:
             region = _build_region(loop_data)
             ss, offset = smart_screenshot(region)
@@ -1032,7 +1161,11 @@ def _check_loop_condition(loop_data, ctx):
         except Exception as e:
             print(f"  [Loop Until] 严重错误 (退出循环): {e}")
             import traceback; traceback.print_exc()
-            return True
+            raise LoopConditionCheckError("Image loop condition check failed") from e
+        finally:
+            if ss:
+                try: ss.close()
+                except Exception: pass
     
     elif mode == 'until_text':
         text = loop_data.get('condition_text', '')
@@ -1042,6 +1175,7 @@ def _check_loop_condition(loop_data, ctx):
             print(f"  [Loop Until] 警告: 文本条件为空")
             return False
         
+        ss = None
         try:
             region = _build_region(loop_data)
             ss, offset = smart_screenshot(region)
@@ -1061,11 +1195,15 @@ def _check_loop_condition(loop_data, ctx):
         except Exception as e:
             print(f"  [Loop Until] 严重错误 (退出循环): {e}")
             import traceback; traceback.print_exc()
-            return True
+            raise LoopConditionCheckError("Text loop condition check failed") from e
+        finally:
+            if ss:
+                try: ss.close()
+                except Exception: pass
     
     return False
 
-core_engine_version = f"1.7.0 Beta (Core) / OpenCV: {OPENCV_AVAILABLE}"
+core_engine_version = f"1.7.1 Beta (Core) / OpenCV: {OPENCV_AVAILABLE}"
 
 # ======================================================================
 # RUN 处理函数：执行命令/脚本/文件
@@ -1090,6 +1228,127 @@ def _build_run_command(command, args):
     if args:
         cmd_list.extend(_split_command_line(args))
     return cmd_list
+
+def _register_active_process(ctx, process):
+    lock = ctx.setdefault('_active_process_lock', threading.RLock())
+    active = ctx.setdefault('_active_processes', set())
+    with lock:
+        active.add(process)
+
+def _unregister_active_process(ctx, process):
+    lock = ctx.setdefault('_active_process_lock', threading.RLock())
+    active = ctx.setdefault('_active_processes', set())
+    with lock:
+        active.discard(process)
+
+def terminate_process_tree(process, wait_timeout=0.5):
+    if process is None or process.poll() is not None:
+        return
+
+    if sys.platform == 'win32':
+        try:
+            subprocess.run(
+                ['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                capture_output=True,
+                text=True,
+                timeout=max(2, wait_timeout + 1)
+            )
+            process.wait(timeout=wait_timeout)
+            return
+        except Exception:
+            pass
+
+    try:
+        process.terminate()
+        process.wait(timeout=wait_timeout)
+        return
+    except Exception:
+        pass
+
+    if process.poll() is None:
+        try:
+            process.kill()
+            process.wait(timeout=wait_timeout)
+        except Exception:
+            pass
+
+def cleanup_active_processes(ctx):
+    if not ctx:
+        return
+    lock = ctx.setdefault('_active_process_lock', threading.RLock())
+    active = ctx.setdefault('_active_processes', set())
+    with lock:
+        processes = list(active)
+    for process in processes:
+        terminate_process_tree(process)
+        _unregister_active_process(ctx, process)
+
+def _execute_subprocess(cmd_list, shell_mode, cwd, timeout, save_output, ctx, run_mode_name):
+    """提取的通用子进程执行与输出处理逻辑"""
+    process = None
+    try:
+        process = subprocess.Popen(
+            cmd_list,
+            shell=shell_mode,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            cwd=cwd if cwd else None
+        )
+        _register_active_process(ctx, process)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            if ctx.get('stop_requested'):
+                raise MacroStopException("Stop requested while RUN process is active")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_process_tree(process)
+                print(f"  [RUN] {run_mode_name}执行超时 ({timeout}秒)")
+                return False
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        
+        output = stdout.strip() if stdout else stderr.strip()
+        
+        if process.returncode == 0:
+            print(f"  [RUN] {run_mode_name}执行成功")
+            if output:
+                print(f"        输出: {_console_safe_text(output[:200])}")
+            if save_output and output:
+                ctx['clipboard_var'] = output
+                try:
+                    if not _copy_to_clipboard_with_retry(output, ctx):
+                        raise RuntimeError("clipboard is busy")
+                    print(f"        已保存到剪贴板")
+                except Exception:
+                    pass
+            return True
+        else:
+            print(f"  [RUN] {run_mode_name}执行失败 (退出码: {process.returncode})")
+            if output:
+                print(f"        错误: {_console_safe_text(output[:200])}")
+            return False
+            
+    except MacroStopException:
+        terminate_process_tree(process)
+        raise
+    except Exception as e:
+        terminate_process_tree(process)
+        print(f"  [RUN] {run_mode_name}执行错误: {e}")
+        return False
+    finally:
+        if process is not None:
+            _unregister_active_process(ctx, process)
+            if process.poll() is not None:
+                for stream in (process.stdout, process.stderr):
+                    if stream and not stream.closed:
+                        stream.close()
 
 def _handle_run(p, ctx):
     """执行命令、脚本或写入文件
@@ -1185,44 +1444,7 @@ def _handle_run(p, ctx):
                 print("  [RUN] 错误: 命令为空")
                 return False
         
-        try:
-            result = subprocess.run(
-                run_cmd,
-                shell=shell_mode,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=timeout,
-                cwd=cwd if cwd else None
-            )
-            
-            output = result.stdout.strip() if result.stdout else result.stderr.strip()
-            
-            if result.returncode == 0:
-                print(f"  [RUN] 命令执行成功")
-                if output:
-                    print(f"        输出: {_console_safe_text(output[:200])}")
-                if save_output and output:
-                    ctx['clipboard_var'] = output
-                    try:
-                        pyperclip.copy(output)
-                        print(f"        已保存到剪贴板")
-                    except Exception:
-                        pass
-                return True
-            else:
-                print(f"  [RUN] 命令执行失败 (退出码: {result.returncode})")
-                if output:
-                    print(f"        错误: {_console_safe_text(output[:200])}")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            print(f"  [RUN] 命令执行超时 ({timeout}秒)")
-            return False
-        except Exception as e:
-            print(f"  [RUN] 命令执行错误: {e}")
-            return False
+        return _execute_subprocess(run_cmd, shell_mode, cwd, timeout, save_output, ctx, "命令")
     
     # === 脚本执行模式 ===
     elif run_type == 'script':
@@ -1267,44 +1489,7 @@ def _handle_run(p, ctx):
             except ValueError:
                 cmd_list.append(args)
         
-        try:
-            result = subprocess.run(
-                cmd_list,
-                shell=False,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=timeout,
-                cwd=cwd if cwd else None
-            )
-            
-            output = result.stdout.strip() if result.stdout else result.stderr.strip()
-            
-            if result.returncode == 0:
-                print(f"  [RUN] 脚本执行成功")
-                if output:
-                    print(f"        输出: {_console_safe_text(output[:200])}")
-                if save_output and output:
-                    ctx['clipboard_var'] = output
-                    try:
-                        pyperclip.copy(output)
-                        print(f"        已保存到剪贴板")
-                    except Exception:
-                        pass
-                return True
-            else:
-                print(f"  [RUN] 脚本执行失败 (退出码: {result.returncode})")
-                if output:
-                    print(f"        错误: {_console_safe_text(output[:200])}")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            print(f"  [RUN] 脚本执行超时 ({timeout}秒)")
-            return False
-        except Exception as e:
-            print(f"  [RUN] 脚本执行错误: {e}")
-            return False
+        return _execute_subprocess(cmd_list, False, cwd, timeout, save_output, ctx, "脚本")
     
     # 未知类型
     else:

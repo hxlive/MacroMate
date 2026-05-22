@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 # MacroAssistant.py
 # 描述: 自动化宏的 GUI 界面
-# 版本: 1.7.0
+# 版本: 1.7.1
 # 变更: 迁移部分代码至sys_utils.py和gui_utils.py,并修复一些小bug和优化了代码结构
+        
 
 # 使用: 
 #   - GUI 模式: python MacroAssistant.py
@@ -39,7 +40,7 @@ import webbrowser
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 APP_TITLE = f"宏助手 (Macro Assistant) v{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 CONFIG_FILE = "macro_settings.json"
@@ -70,7 +71,8 @@ try:
     from sys_utils import (
         init_system_runtime, set_windows_app_id, 
         GlobalHotkeyManager, MouseTracker, RegionSelector, 
-        HotkeySettingsDialog, VLMSettingsDialog, ImageTooltipManager, MiniStatusWindow
+        HotkeySettingsDialog, VLMSettingsDialog, ImageTooltipManager, MiniStatusWindow,
+        AboutDialog
     )
     from gui_utils import (
         ParamWidgetFactory, parse_region_string, resource_path, get_icon_path,
@@ -82,6 +84,30 @@ except ImportError as e:
     exit()
 
 def capitalize_hotkey_str(s): return HotkeyUtils.format_hotkey_display(s)
+
+
+def _region_box_to_screenshot_region(region_box):
+    """Convert an optional bbox into the screenshot region used by test actions."""
+    if region_box is None:
+        return None
+
+    region = macro_engine.bbox_to_region(region_box)
+    if region is None:
+        raise ValueError(f"手动查找区域解析失败(格式错误): {region_box}")
+    return region
+
+
+def _parse_optional_test_region(region_value):
+    raw_region = (region_value or "").strip()
+    if not raw_region:
+        return None
+
+    region_box = parse_region_string(raw_region)
+    if region_box is None:
+        raise ValueError("手动查找区域格式无效，应为 x1, y1, x2, y2")
+
+    _region_box_to_screenshot_region(region_box)
+    return region_box
 
 
 class MacroApp:
@@ -121,7 +147,8 @@ class MacroApp:
         self.is_macro_running = False
         self.last_test_location = None 
         self.current_run_context = None 
-        self._macro_thread = None          # [新增] 保存执行线程引用以支持强制中断
+        self.current_filepath = None
+        self._macro_thread = None          # [新增] 保存执行线程引用 by Antigravity
         self._stop_in_progress = False   # 防重复停止标志
         self._run_pending = False        # 延迟启动挂起标志
         self._pending_run_id = None      # 延迟启动的 after ID
@@ -142,7 +169,7 @@ class MacroApp:
         self.current_theme = tb.StringVar(value=self.root.style.theme_use())
         self.skip_confirm_var = tb.BooleanVar(value=False)
         self.dont_minimize_var = tb.BooleanVar(value=False)
-        self.enhanced_mode_var = tb.BooleanVar(value=True)
+        self.enhanced_mode_var = tb.BooleanVar(value=False)
         self.run_enabled_var = tb.BooleanVar(value=False)
         self.recent_files = []
         self.status_queue = queue.Queue()
@@ -373,7 +400,7 @@ class MacroApp:
         minimize_check = ttk.Checkbutton(check_frame, text="运行时主界面不最小化", variable=self.dont_minimize_var, bootstyle="primary-round-toggle")
         minimize_check.grid(row=0, column=1, sticky="w", padx=2, pady=(0, 5))
         
-        enhanced_check = ttk.Checkbutton(check_frame, text="开启增强模式 (OCR 多级缩放匹配)", variable=self.enhanced_mode_var, bootstyle="success-round-toggle")
+        enhanced_check = ttk.Checkbutton(check_frame, text="开启增强模式 (识别不到小字时可开启)", variable=self.enhanced_mode_var, bootstyle="success-round-toggle")
         enhanced_check.grid(row=1, column=0, sticky="w", padx=2, pady=(0, 5))
         
         run_enabled_check = ttk.Checkbutton(check_frame, text="启用 RUN 步骤 (注意安全风险)", variable=self.run_enabled_var, bootstyle="danger-round-toggle")
@@ -411,27 +438,6 @@ class MacroApp:
         self.update_param_fields(None)
 
     # --- Treeview 辅助方法 ---
-    def _param_display_to_internal(self, key, display_value):
-        """将UI显示值转换为内部存储值（委托给 gui_utils）"""
-        return param_display_to_internal(
-            key, 
-            display_value, 
-            self.FULL_OCR_KEY_MAP,
-            MacroSchema.LANG_OPTIONS,
-            MacroSchema.CLICK_OPTIONS
-        )
-    
-    def _param_internal_to_display(self, key, internal_value):
-        """将内部存储值转换为UI显示值（委托给 gui_utils）"""
-        return param_internal_to_display(
-            key,
-            internal_value,
-            self.FULL_OCR_NAME_MAP,
-            MacroSchema.LANG_VALUES_TO_NAME,
-            MacroSchema.CLICK_VALUES_TO_NAME,
-            self.available_ocr_keys
-        )
-
     def _get_selected_index(self):
         """获取当前选中项的索引"""
         selected_items = self.steps_tree.selection()
@@ -444,6 +450,14 @@ class MacroApp:
         stop_display = capitalize_hotkey_str(self.hotkey_stop_str.get())
         self.status_var.set(f"准备就绪...  |  [{run_display}] 启动宏  |  [{stop_display}] 停止宏")
         self.run_btn.config(text=f"▶ 运行宏 ({run_display})")
+
+    def update_title(self):
+        """更新窗口标题栏，额外加上当前宏文件的文件名"""
+        if self.current_filepath:
+            filename = os.path.basename(self.current_filepath)
+            self.root.title(f"{APP_TITLE}  ---  {filename}")
+        else:
+            self.root.title(APP_TITLE)
 
     def open_hotkey_settings(self):
         """打开快捷键设置对话框"""
@@ -491,192 +505,19 @@ class MacroApp:
 
     def show_about_dialog(self):
         """显示关于对话框"""
-        # 防止重复打开关于对话框
-        if hasattr(self, '_about_dialog_ref') and self._about_dialog_ref and self._about_dialog_ref.winfo_exists():
-            self._about_dialog_ref.focus_force()
+        if hasattr(self, '_about_dialog_ref') and self._about_dialog_ref and self._about_dialog_ref.dialog.winfo_exists():
+            self._about_dialog_ref.dialog.focus_force()
             return
-        
-        # 创建关于对话框
-        about_dialog = tk.Toplevel(self.root)
-        about_dialog.withdraw()  # 立即隐藏，防止闪烁
-        self._about_dialog_ref = about_dialog
-        about_dialog.title("关于")
-        about_dialog.geometry("500x400")  # 足够宽度显示完整链接
-        about_dialog.resizable(False, False)
-        about_dialog.transient(self.root)
-        about_dialog.grab_set()
-        
-        # 获取图标路径（只调用一次）
+            
         icon_path = get_icon_path()
-        
-        # 设置窗口图标
-        if icon_path and os.path.exists(icon_path):
-            try:
-                about_dialog.iconbitmap(icon_path)
-            except (OSError, tk.TclError) as e:
-                print(f"[警告] 设置关于对话框图标失败: {e}")
-        
-        # 相对于主窗口居中显示
-        about_dialog.update_idletasks()
-        
-        # 获取主窗口的位置和大小
-        main_x = self.root.winfo_x()
-        main_y = self.root.winfo_y()
-        main_width = self.root.winfo_width()
-        main_height = self.root.winfo_height()
-        
-        # 获取关于对话框的大小
-        dialog_width = about_dialog.winfo_width()
-        dialog_height = about_dialog.winfo_height()
-        
-        # 计算居中位置
-        x = main_x + (main_width - dialog_width) // 2
-        y = main_y + (main_height - dialog_height) // 2
-        
-        about_dialog.geometry(f"+{x}+{y}")
-        about_dialog.deiconify()  # 位置确定后再显示
-        
-        # 主框架 - 减小内边距
-        main_frame = ttk.Frame(about_dialog, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # ========== 顶部：图标和软件标题区域 ==========
-        # 外层容器 - 将所有内容居中
-        top_outer = ttk.Frame(main_frame)
-        top_outer.pack(fill=tk.X, pady=(5, 18))
-        
-        # 内层容器 - 实际内容区域
-        top_frame = ttk.Frame(top_outer)
-        top_frame.pack(anchor="center")
-        
-        # 左侧：图标
-        icon_container = ttk.Frame(top_frame)
-        icon_container.pack(side=tk.LEFT, padx=(0, 28))
-        
-        # 显示图标（使用已获取的icon_path）
-        if icon_path and os.path.exists(icon_path):
-            try:
-                # [修复] 使用 load()+copy() 确保图像数据在文件关闭后仍有效
-                from PIL import ImageTk
-                with Image.open(icon_path) as _raw:
-                    _raw.load()
-                    _icon_copy = _raw.copy()
-                resized_img = _icon_copy.resize((96, 96), Image.Resampling.LANCZOS)
-                icon_photo = ImageTk.PhotoImage(resized_img)
-                
-                icon_label = ttk.Label(icon_container, image=icon_photo)
-                icon_label.image = icon_photo  # 保持引用防止被垃圾回收
-                icon_label.pack()
-            except (OSError, IOError) as e:
-                print(f"[警告] 加载图标图像失败: {e}")
-                ttk.Label(icon_container, text="🔧", font=("Microsoft YaHei UI", 48)).pack()
-        else:
-            ttk.Label(icon_container, text="🔧", font=("Microsoft YaHei UI", 48)).pack()
-        
-        # 右侧：软件标题和版本（左对齐）
-        title_container = ttk.Frame(top_frame)
-        title_container.pack(side=tk.LEFT, pady=10)
-        
-        # 软件名称
-        ttk.Label(title_container, 
-                 text="宏助手",
-                 font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w", pady=(0, 2))
-        
-        ttk.Label(title_container, 
-                 text="Macro Assistant",
-                 font=("Microsoft YaHei UI", 10),
-                 foreground="#666666").pack(anchor="w", pady=(0, 6))
-        
-        # 版本信息
-        version_frame = ttk.Frame(title_container)
-        version_frame.pack(anchor="w")
-        
-        version_label = ttk.Label(version_frame, 
-                                 text=f" v{APP_VERSION} ",
-                                 font=("Consolas", 9, "bold"),
-                                 bootstyle="info",
-                                 padding=(6, 2))
-        version_label.pack(side=tk.LEFT)
-
-        
-        # ========== 分隔线 ==========
-        separator1 = ttk.Separator(main_frame, orient='horizontal')
-        separator1.pack(fill='x', pady=(0, 18))
-        
-        # ========== 中部：详细信息区域 ==========
-        info_frame = ttk.Frame(main_frame)
-        info_frame.pack(fill=tk.X, pady=(0, 18), padx=5)
-        
-        # 使用网格布局，更整齐
-        info_frame.columnconfigure(1, weight=1)
-        
-        # 作者信息
-        ttk.Label(info_frame, 
-                 text="软件作者",
-                 font=("Microsoft YaHei UI", 10, "bold"),
-                 foreground="#777777").grid(row=0, column=0, sticky="w", padx=(0, 20), pady=6)
-        
-        ttk.Label(info_frame, 
-                 text="寒星",
-                 font=("Microsoft YaHei UI", 10)).grid(row=0, column=1, sticky="w", pady=6)
-        
-        # 项目主页
-        ttk.Label(info_frame, 
-                 text="项目主页",
-                 font=("Microsoft YaHei UI", 10, "bold"),
-                 foreground="#777777").grid(row=1, column=0, sticky="w", padx=(0, 20), pady=6)
-        
-        # 链接标签
-        link_label = ttk.Label(info_frame, 
-                              text="github.com/hxlive/MacroAssistant",
-                              font=("Microsoft YaHei UI", 10),
-                              foreground="#0066CC",
-                              cursor="hand2")
-        link_label.grid(row=1, column=1, sticky="w", pady=6)
-        
-        # 绑定点击事件
-        link_label.bind("<Button-1>", 
-                       lambda e: webbrowser.open("https://github.com/hxlive/MacroAssistant/"))
-        
-        # 鼠标悬停效果
-        def on_enter(e):
-            link_label.config(font=("Microsoft YaHei UI", 10, "underline"), foreground="#0052A3")
-        def on_leave(e):
-            link_label.config(font=("Microsoft YaHei UI", 10), foreground="#0066CC")
-        
-        link_label.bind("<Enter>", on_enter)
-        link_label.bind("<Leave>", on_leave)
-        
-        # ========== 分隔线 ==========
-        separator2 = ttk.Separator(main_frame, orient='horizontal')
-        separator2.pack(fill='x', pady=(0, 18))
-        
-        # ========== 底部：操作按钮区域 ==========
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        # 关闭按钮 - 居中显示
-        close_btn = ttk.Button(button_frame, 
-                              text="确  定",
-                              command=about_dialog.destroy,
-                              bootstyle="primary",
-                              width=18,
-                              padding=(15, 8))
-        close_btn.pack(anchor="center")
-        
-        # 对话框销毁时清理引用
-        def on_dialog_destroy(event=None):
-            self._about_dialog_ref = None
-        
-        about_dialog.bind("<Destroy>", on_dialog_destroy)
-        
-        # ESC键和回车键关闭
-        about_dialog.bind("<Escape>", lambda e: about_dialog.destroy())
-        about_dialog.bind("<Return>", lambda e: about_dialog.destroy())
+        self._about_dialog_ref = AboutDialog(self.root, APP_VERSION, icon_path)
 
 
     def on_exit(self):
         self.is_app_running = False
+        self.safe_stop_macro()
+        if self.current_run_context:
+            macro_engine.cleanup_active_processes(self.current_run_context)
         
         # [变更] 使用 MouseTracker 类停止
         self.mouse_tracker.stop()
@@ -714,8 +555,8 @@ class MacroApp:
             'on_test_find_image_click': self.on_test_find_image_click,
             'on_test_find_text_click': self.on_test_find_text_click,
             'on_test_ai_command_click': self.on_test_ai_command_click,
-            'update_loop_params': self.update_loop_params,
-            'update_run_params': self.update_run_params,
+            'update_loop_params': lambda event: update_loop_params(self.param_widgets, self.param_frame, self.param_widgets.get('mode')) if self.param_widgets.get('mode') is not None else None,
+            'update_run_params': lambda event: update_run_params(self.param_widgets, self.param_frame, self.param_widgets.get('run_type')) if self.param_widgets.get('run_type') is not None else None,
             'mouse_tracker': self.mouse_tracker,
             'mouse_pos_var': self.mouse_pos_var
         }
@@ -737,18 +578,6 @@ class MacroApp:
 
 
     # update_loop_params 和 update_run_params 已迁移到 gui_utils.py
-
-    def update_loop_params(self, event):
-        """包装函数：调用 gui_utils 中的 update_loop_params"""
-        if self.param_widgets.get('mode') is None:
-            return
-        update_loop_params(self.param_widgets, self.param_frame, self.param_widgets.get('mode'))
-
-    def update_run_params(self, event):
-        """包装函数：调用 gui_utils 中的 update_run_params"""
-        if self.param_widgets.get('run_type') is None:
-            return
-        update_run_params(self.param_widgets, self.param_frame, self.param_widgets.get('run_type'))
 
     def on_select_region(self, entry_widget):
         self.root.iconify()
@@ -780,9 +609,7 @@ class MacroApp:
             # <--- 读取搜索范围
             region_box = None
             if 'region' in self.param_widgets:
-                val = self.param_widgets['region'].get().strip()
-                # [变更] 使用 gui_utils.parse_region_string
-                region_box = parse_region_string(val)
+                region_box = _parse_optional_test_region(self.param_widgets['region'].get())
 
             self.status_var.set("测试中...")
             self.root.iconify()
@@ -811,9 +638,7 @@ class MacroApp:
             
             region_box = None
             if 'region' in self.param_widgets:
-                val = self.param_widgets['region'].get().strip()
-                # [变更] 使用 gui_utils.parse_region_string
-                region_box = parse_region_string(val)
+                region_box = _parse_optional_test_region(self.param_widgets['region'].get())
             
             if not text: raise ValueError
             self.status_var.set("测试中...")
@@ -833,8 +658,7 @@ class MacroApp:
             # 读取区域
             region_box = None
             if 'region' in self.param_widgets:
-                val = self.param_widgets['region'].get().strip()
-                region_box = parse_region_string(val)
+                region_box = _parse_optional_test_region(self.param_widgets['region'].get())
             
             self.status_var.set("AI 分析中...")
             self.root.iconify()
@@ -850,6 +674,7 @@ class MacroApp:
     def _test_ai_command(self, instruction, region_box=None):
         """后台执行 AI 指令测试"""
         try:
+            _region_box_to_screenshot_region(region_box)
             coords = vlm_engine.find_location_by_vlm(instruction, region=region_box)
             self.root.after(0, lambda: self._on_test_ai_complete(coords))
         except Exception as e:
@@ -872,35 +697,35 @@ class MacroApp:
         threading.Thread(target=func, args=args, daemon=True).start()
 
     def _test_find_image(self, path, conf, region_box=None):
+        screenshot = None
         try:
-            # <--- 根据区域截图
-            if region_box:
-                screenshot = ImageGrab.grab(bbox=tuple(region_box))
-                offset = (region_box[0], region_box[1])
-            else:
-                screenshot = ImageGrab.grab()
-                offset = (0, 0)
+            screenshot_region = _region_box_to_screenshot_region(region_box)
+            screenshot, offset = macro_engine.smart_screenshot(screenshot_region)
                 
             res_val = macro_engine.find_image_cv2(path, conf, screenshot_pil=screenshot, offset=offset)
             loc = res_val[0] if res_val else None
             self.root.after(0, lambda: self._on_test_complete(loc))
         except Exception as e: 
             self.root.after(0, lambda err=e: self._on_test_error(err))
+        finally:
+            if screenshot:
+                try: screenshot.close()
+                except Exception: pass
 
     def _test_find_text(self, text, lang, engine, region_box=None):
+        screenshot = None
         try:
-            # <--- 根据区域截图
-            if region_box:
-                screenshot = ImageGrab.grab(bbox=tuple(region_box))
-                offset = (region_box[0], region_box[1])
-            else:
-                screenshot = ImageGrab.grab()
-                offset = (0, 0)
+            screenshot_region = _region_box_to_screenshot_region(region_box)
+            screenshot, offset = macro_engine.smart_screenshot(screenshot_region)
             
             loc = ocr_engine.find_text_location(text, lang, True, screenshot_pil=screenshot, offset=offset, engine=engine)
             self.root.after(0, lambda: self._on_test_complete(loc))
         except Exception as e: 
             self.root.after(0, lambda err=e: self._on_test_error(err))
+        finally:
+            if screenshot:
+                try: screenshot.close()
+                except Exception: pass
 
     def _on_test_complete(self, loc):
         self.root.deiconify()
@@ -955,12 +780,17 @@ class MacroApp:
             messagebox.showwarning("输入错误", error)
             return
             
+        # 如果原来是 cache_box，且保存时仍收集到了 region，则自动将其转回 cache_box 以保持旧宏语义
+        if getattr(self, 'editing_step_has_cache_box', False) and 'region' in params:
+            params['cache_box'] = params.pop('region')
+            
         step = {"action": action, "params": params}
         
         # 仅在没有手动指定区域时，才询问是否使用测试结果作为缓存
         if action in ('FIND_TEXT', 'FIND_IMAGE', 'IF_TEXT_FOUND', 'IF_IMAGE_FOUND') \
-           and not self.editing_index \
+           and self.editing_index is None \
            and self.last_test_location \
+           and 'region' not in step['params'] \
            and 'cache_box' not in step['params']:
             if messagebox.askyesno("缓存", "使用测试坐标作为缓存？"):
                 step["params"]["cache_box"] = [self.last_test_location[0], self.last_test_location[1], self.last_test_location[0]+1, self.last_test_location[1]+1]
@@ -1032,8 +862,8 @@ class MacroApp:
                 self.param_widgets['mode'].set(display_mode)
             
             # 2. 强行触发界面刷新 (这一步会让"目标文本"输入框从隐藏变为显示)
-            # 必须在填入"沙发"等文字之前完成这一步！
-            self.update_loop_params(None)
+            if 'mode' in self.param_widgets:
+                update_loop_params(self.param_widgets, self.param_frame, self.param_widgets['mode'])
 
         # ============================================================
         # [新增] 优先强制处理 RUN 的类型
@@ -1054,16 +884,18 @@ class MacroApp:
             if 'run_type' in self.param_widgets:
                 self.param_widgets['run_type'].set(display_run_type)
             
-            # 2. 强行触发界面刷新 (这一步会让对应类型的输入框显示出来)
-            self.update_run_params(None)
+            if 'run_type' in self.param_widgets:
+                update_run_params(self.param_widgets, self.param_frame, self.param_widgets['run_type'])
 
         # ============================================================
         # 常规参数填充 (此时输入框已经显示出来了，可以安全填值了)
         # ============================================================
         
         # 预处理 Region 显示
-        if 'cache_box' in step['params'] and 'region' in self.param_widgets:
-            cb = step['params']['cache_box']
+        if 'region' in self.param_widgets:
+            cb = step['params'].get('region', step['params'].get('cache_box'))
+            # 记录被编辑步骤在加载前是否是 cache_box 而非 region
+            self.editing_step_has_cache_box = ('cache_box' in step['params'] and 'region' not in step['params'])
             if isinstance(cb, list) and len(cb) == 4:
                 self.param_widgets['region'].delete(0, tk.END)
                 self.param_widgets['region'].insert(0, f"{cb[0]}, {cb[1]}, {cb[2]}, {cb[3]}")
@@ -1076,9 +908,14 @@ class MacroApp:
             if k in self.param_widgets:
                 w = self.param_widgets[k]
                 
-                # [重构] 使用统一的参数映射函数
                 if k in ('lang', 'button', 'engine'):
-                    display_val = self._param_internal_to_display(k, v)
+                    display_val = param_internal_to_display(
+                        k, v,
+                        self.FULL_OCR_NAME_MAP,
+                        MacroSchema.LANG_VALUES_TO_NAME,
+                        MacroSchema.CLICK_VALUES_TO_NAME,
+                        self.available_ocr_keys
+                    )
                 else:
                     display_val = v
                 
@@ -1098,6 +935,7 @@ class MacroApp:
 
     def cancel_edit_mode(self):
         self.editing_index = None
+        self.editing_step_has_cache_box = False  # 重置标志
         self.add_step_btn.config(text="＋ 添加到序列 >>", bootstyle="success")
         self.cancel_edit_btn.grid_remove()
         self.add_step_btn.grid_configure(columnspan=2)
@@ -1120,8 +958,8 @@ class MacroApp:
             display_params = step['params'].copy()
             
             cache_str = ""
-            if 'cache_box' in display_params:
-                box = display_params.pop('cache_box')
+            if 'region' in display_params or 'cache_box' in display_params:
+                box = display_params.pop('region', display_params.pop('cache_box', None))
                 cache_str = f"[区域: {box[0]},{box[1]},{box[2]},{box[3]}] "
 
             if 'engine' in display_params:
@@ -1244,7 +1082,7 @@ class MacroApp:
 
     def safe_run_macro(self):
         # [修复BUG-5] 步骤为空时给出明确提示，而非静默无响应
-        if not self.is_macro_running and self.editing_index is None:
+        if not self.is_macro_running and not self._run_pending and self.editing_index is None:
             if not self.steps:
                 self.root.after(0, lambda: self.status_var.set("提示: 宏为空，请先添加步骤再运行"))
                 return
@@ -1260,6 +1098,7 @@ class MacroApp:
                 self.root.after_cancel(self._pending_run_id)
                 self._pending_run_id = None
             self.status_var.set("已取消待执行的宏")
+            self._restore_macro_idle_ui()
             return
         if not self.is_macro_running:
             return
@@ -1268,6 +1107,7 @@ class MacroApp:
         # 同时设置标志位（兼容 WAIT 内的分段检查）
         if self.current_run_context:
             self.current_run_context['stop_requested'] = True
+            macro_engine.cleanup_active_processes(self.current_run_context)
         # 强制向执行线程注入 MacroStopException
         t = self._macro_thread
         if t and t.is_alive():
@@ -1287,7 +1127,7 @@ class MacroApp:
                     print("[中断] MacroStopException 已弹射到执行线程")
         
     def run_macro(self, hotkey=False):
-        if self.is_macro_running or not self.steps: return
+        if self.is_macro_running or self._run_pending or not self.steps: return
         stop_display = capitalize_hotkey_str(self.hotkey_stop_str.get())
         
         if not hotkey and not self.skip_confirm_var.get():
@@ -1349,19 +1189,21 @@ class MacroApp:
         finally:
             self.root.after(0, self._on_macro_complete)
 
+    def _restore_macro_idle_ui(self):
+        if self.mini_status_window:
+            self.mini_status_window.destroy()
+            self.mini_status_window = None
+
+        self.root.deiconify()
+        self.root.attributes('-topmost', False)
+        self.run_btn.config(state="normal")
+
     def _on_macro_complete(self):
         self.is_macro_running = False
         self._stop_in_progress = False
         self.current_run_context = None
-        
-        # [新增] 销毁迷你状态栏窗口
-        if self.mini_status_window:
-            self.mini_status_window.destroy()
-            self.mini_status_window = None
-        
-        self.root.deiconify()
-        self.root.attributes('-topmost', False)
-        self.run_btn.config(state="normal")
+
+        self._restore_macro_idle_ui()
         self.update_status_bar_hotkeys() 
 
     def update_loop_status(self, text):
@@ -1411,8 +1253,10 @@ class MacroApp:
         self.steps = []
         self.editing_index = None
         self.last_test_location = None
+        self.current_filepath = None
         self.cancel_edit_mode()
         self.update_listbox_display()
+        self.update_title()
         self.status_var.set("已新建空白宏。")
 
     def load_macro(self):
@@ -1425,6 +1269,8 @@ class MacroApp:
         if f:
             try:
                 MacroPersistence.save(f, self.steps)
+                self.current_filepath = f
+                self.update_title()
                 messagebox.showinfo("成功", "宏已保存！")
                 self.add_to_recent_files(f)
             except Exception as e: messagebox.showerror("失败", str(e))
@@ -1446,7 +1292,9 @@ class MacroApp:
                 return
             
             self.steps = data
+            self.current_filepath = f
             self.update_listbox_display()
+            self.update_title()
             self.status_var.set(f"已加载: {os.path.basename(f)}")
             self.add_to_recent_files(f)
         except Exception as e: 
@@ -1477,7 +1325,7 @@ class MacroApp:
                     self.current_theme.set(d.get('theme', 'litera'))
                     self.hotkey_run_str.set(d.get('hotkey_run', DEFAULT_HOTKEY_RUN))
                     self.hotkey_stop_str.set(d.get('hotkey_stop', DEFAULT_HOTKEY_STOP))
-                    self.enhanced_mode_var.set(d.get('enhanced_mode', True))
+                    self.enhanced_mode_var.set(d.get('enhanced_mode', False))
                     self.run_enabled_var.set(d.get('run_enabled', False))
                     self.skip_confirm_var.set(d.get('skip_confirm', False))
                     self.dont_minimize_var.set(d.get('dont_minimize', False))
@@ -1488,17 +1336,29 @@ class MacroApp:
     def save_app_settings(self):
         """保存应用设置"""
         try:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'recent_files': self.recent_files,
-                    'theme': self.current_theme.get(),
-                    'hotkey_run': self.hotkey_run_str.get(),
-                    'hotkey_stop': self.hotkey_stop_str.get(),
-                    'enhanced_mode': self.enhanced_mode_var.get(),
-                    'run_enabled': self.run_enabled_var.get(),
-                    'skip_confirm': self.skip_confirm_var.get(),
-                    'dont_minimize': self.dont_minimize_var.get()
-                }, f, indent=2)
+            settings = {}
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                    if not isinstance(settings, dict):
+                        settings = {}
+                except Exception:
+                    settings = {}
+            settings.update({
+                'recent_files': self.recent_files,
+                'theme': self.current_theme.get(),
+                'hotkey_run': self.hotkey_run_str.get(),
+                'hotkey_stop': self.hotkey_stop_str.get(),
+                'enhanced_mode': self.enhanced_mode_var.get(),
+                'run_enabled': self.run_enabled_var.get(),
+                'skip_confirm': self.skip_confirm_var.get(),
+                'dont_minimize': self.dont_minimize_var.get()
+            })
+            tmp_path = CONFIG_FILE + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, CONFIG_FILE)
         except Exception as e:
             print(f"[设置] 保存应用设置失败: {e}")
 
@@ -1564,6 +1424,9 @@ if __name__ == "__main__":
                 print("[CLI] Script failed")
                 sys.exit(1)
                 
+        except macro_engine.MacroStopException as e:
+            print(f"\n[CLI] 宏执行已被用户或系统安全机制中断: {e}")
+            sys.exit(1)
         except Exception as e:
             import traceback
             error_msg = str(e)
@@ -1573,7 +1436,7 @@ if __name__ == "__main__":
             sys.exit(1)
     else:
         # GUI 模式
-        pyautogui.FAILSAFE = False
+        pyautogui.FAILSAFE = True
         try:
             theme = args.theme
             if os.path.exists(CONFIG_FILE):

@@ -1,6 +1,6 @@
 # sys_utils.py
 # 描述: 系统底层工具、全局热键管理及稳定工具类集
-# 版本: 1.7.0
+# 版本: 1.7.1
 
 import sys
 import os
@@ -117,8 +117,32 @@ class RegionSelector:
         self.is_selecting = False
         self.start_x = 0; self.start_y = 0; self.cur_x = 0; self.cur_y = 0
 
+        # 获取虚拟显示器的联合（Virtual Screen）坐标，以完美覆盖多屏
+        self.offset_x = 0
+        self.offset_y = 0
+        w = self.master.winfo_screenwidth()
+        h = self.master.winfo_screenheight()
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                SM_XVIRTUALSCREEN = 76
+                SM_YVIRTUALSCREEN = 77
+                SM_CXVIRTUALSCREEN = 78
+                SM_CYVIRTUALSCREEN = 79
+                user32 = ctypes.windll.user32
+                x_val = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+                y_val = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+                w_val = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+                h_val = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+                if w_val > 0 and h_val > 0:
+                    self.offset_x, self.offset_y, w, h = x_val, y_val, w_val, h_val
+            except Exception as e:
+                print(f"[RegionSelector] 获取多屏几何信息失败: {e}")
+
         self.top = tk.Toplevel(self.master)
-        self.top.attributes('-fullscreen', True)
+        ox = f"+{self.offset_x}" if self.offset_x >= 0 else str(self.offset_x)
+        oy = f"+{self.offset_y}" if self.offset_y >= 0 else str(self.offset_y)
+        self.top.geometry(f"{w}x{h}{ox}{oy}")
         self.top.attributes('-alpha', 0.3)
         self.top.attributes('-topmost', True)
         self.top.configure(cursor="cross")
@@ -141,8 +165,8 @@ class RegionSelector:
 
     def _finalize_selection(self):
         if self.cur_x != 0 or self.cur_y != 0:
-            x1, y1 = min(self.start_x, self.cur_x), min(self.start_y, self.cur_y)
-            x2, y2 = max(self.start_x, self.cur_x), max(self.start_y, self.cur_y)
+            x1, y1 = min(self.start_x, self.cur_x) + self.offset_x, min(self.start_y, self.cur_y) + self.offset_y
+            x2, y2 = max(self.start_x, self.cur_x) + self.offset_x, max(self.start_y, self.cur_y) + self.offset_y
             if abs(x2 - x1) > 5 and abs(y2 - y1) > 5:
                 self.selection = (x1, y1, x2, y2)
         self.top.destroy()
@@ -232,6 +256,28 @@ class GlobalHotkeyManager:
         return key_name
 
     def _modifiers_satisfied(self, required_mods):
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                vk_map = {
+                    'ctrl': [0x11],        # VK_CONTROL
+                    'alt': [0x12],         # VK_MENU
+                    'shift': [0x10],       # VK_SHIFT
+                    'cmd': [0x5B, 0x5C]    # VK_LWIN, VK_RWIN
+                }
+                for mod, vks in vk_map.items():
+                    is_pressed = False
+                    for vk in vks:
+                        if (ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000) != 0:
+                            is_pressed = True
+                            break
+                    if not is_pressed:
+                        self.held_keys.pop(mod, None)
+                    else:
+                        if mod not in self.held_keys:
+                            self.held_keys[mod] = 1
+            except Exception as e:
+                print(f"[Hotkey] check physical keys failed: {e}")
         return all(self.held_keys.get(m, 0) > 0 for m in required_mods)
 
     def on_press(self, key):
@@ -239,14 +285,17 @@ class GlobalHotkeyManager:
             key_name = self._normalize_key(self._get_key_name(key))
             if not key_name: return
             
-            self.held_keys[key_name] = self.held_keys.get(key_name, 0) + 1
-            if self.held_keys[key_name] == 1:
-                run_mods, run_key = self._parse_hotkey(self.get_run_str())
-                if key_name == run_key and self._modifiers_satisfied(run_mods):
-                    self.root.after(0, self.trigger_run)
-                stop_mods, stop_key = self._parse_hotkey(self.get_stop_str())
-                if key_name == stop_key and self._modifiers_satisfied(stop_mods):
-                    self.root.after(0, self.trigger_stop)
+            # [优化] 长按重复触发拦截，防止多次累加造成计数器残留
+            if self.held_keys.get(key_name, 0) > 0:
+                return
+                
+            self.held_keys[key_name] = 1
+            run_mods, run_key = self._parse_hotkey(self.get_run_str())
+            if key_name == run_key and self._modifiers_satisfied(run_mods):
+                self.root.after(0, self.trigger_run)
+            stop_mods, stop_key = self._parse_hotkey(self.get_stop_str())
+            if key_name == stop_key and self._modifiers_satisfied(stop_mods):
+                self.root.after(0, self.trigger_stop)
         except Exception as e:
             print(f"[Hotkey] press error: {e}")
             import traceback; traceback.print_exc()
@@ -255,10 +304,8 @@ class GlobalHotkeyManager:
         try:
             key_name = self._normalize_key(self._get_key_name(key))
             if not key_name: return
-            if key_name in self.held_keys:
-                self.held_keys[key_name] -= 1
-                if self.held_keys[key_name] <= 0:
-                    del self.held_keys[key_name]
+            # [优化] 松开按键时直接清空字典中该键的状态，根治所有残留假死
+            self.held_keys.pop(key_name, None)
         except Exception as e:
             print(f"[Hotkey] release error: {e}")
             import traceback; traceback.print_exc()
@@ -682,18 +729,22 @@ class VLMSettingsDialog:
             self.dialog.update()
 
             def _do_test():
+                screenshot = None
                 try:
                     from PIL import ImageGrab
                     screenshot = ImageGrab.grab()
                     buf = io.BytesIO()
                     screenshot.save(buf, format='JPEG', quality=85)
                     image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-                    vlm_engine.call_vlm_api("描述你看到了什么？", image_b64=image_b64, config=config)
+                    vlm_engine.call_vlm_api("描述你看到了什么？", image_b64=image_b64, config=config, raise_on_error=True)
                     self.dialog.after(0, lambda: messagebox.showinfo("成功", "API 连接成功！", parent=self.dialog))
                 except Exception as e:
                     err = str(e)
                     self.dialog.after(0, lambda msg=err: messagebox.showerror("错误", f"连接失败:\n{msg}", parent=self.dialog))
                 finally:
+                    if screenshot:
+                        try: screenshot.close()
+                        except Exception: pass
                     # 恢复 UI 状态
                     def _restore():
                         try:
@@ -874,3 +925,116 @@ class MiniStatusWindow:
                 self.window.destroy()
         except tk.TclError:
             pass
+
+class AboutDialog:
+    """宏助手关于对话框"""
+    def __init__(self, parent, app_version, icon_path=None):
+        self.parent = parent
+        
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.withdraw()  # 立即隐藏，防止闪烁
+        self.dialog.title("关于")
+        self.dialog.geometry("500x400")  # 足够宽度显示完整链接
+        self.dialog.resizable(False, False)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        # 设置窗口图标
+        if icon_path and os.path.exists(icon_path):
+            try:
+                self.dialog.iconbitmap(icon_path)
+            except (OSError, tk.TclError) as e:
+                print(f"[警告] 设置关于对话框图标失败: {e}")
+                
+        # 居中显示
+        self.dialog.update_idletasks()
+        main_x = parent.winfo_x()
+        main_y = parent.winfo_y()
+        main_width = parent.winfo_width()
+        main_height = parent.winfo_height()
+        dialog_width = self.dialog.winfo_width()
+        dialog_height = self.dialog.winfo_height()
+        x = main_x + (main_width - dialog_width) // 2
+        y = main_y + (main_height - dialog_height) // 2
+        self.dialog.geometry(f"+{x}+{y}")
+        self.dialog.deiconify()  # 位置确定后再显示
+
+        self._create_ui(app_version, icon_path)
+        
+        # 绑定事件
+        self.dialog.bind("<Escape>", lambda e: self.dialog.destroy())
+        self.dialog.bind("<Return>", lambda e: self.dialog.destroy())
+
+    def _create_ui(self, app_version, icon_path):
+        import webbrowser
+        from PIL import Image, ImageTk
+        
+        main_frame = ttk.Frame(self.dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # ========== 顶部：图标和软件标题区域 ==========
+        top_outer = ttk.Frame(main_frame)
+        top_outer.pack(fill=tk.X, pady=(5, 18))
+        
+        top_frame = ttk.Frame(top_outer)
+        top_frame.pack(anchor="center")
+        
+        # 左侧：图标
+        icon_container = ttk.Frame(top_frame)
+        icon_container.pack(side=tk.LEFT, padx=(0, 28))
+        
+        if icon_path and os.path.exists(icon_path):
+            try:
+                with Image.open(icon_path) as _raw:
+                    _raw.load()
+                    _icon_copy = _raw.copy()
+                resized_img = _icon_copy.resize((96, 96), Image.Resampling.LANCZOS)
+                icon_photo = ImageTk.PhotoImage(resized_img)
+                
+                icon_label = ttk.Label(icon_container, image=icon_photo)
+                icon_label.image = icon_photo
+                icon_label.pack()
+            except (OSError, IOError) as e:
+                print(f"[警告] 加载图标图像失败: {e}")
+                ttk.Label(icon_container, text="🔧", font=("Microsoft YaHei UI", 48)).pack()
+        else:
+            ttk.Label(icon_container, text="🔧", font=("Microsoft YaHei UI", 48)).pack()
+            
+        # 右侧：软件标题和版本
+        title_container = ttk.Frame(top_frame)
+        title_container.pack(side=tk.LEFT, pady=10)
+        
+        ttk.Label(title_container, text="宏助手", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Label(title_container, text="Macro Assistant", font=("Microsoft YaHei UI", 10), foreground="#666666").pack(anchor="w", pady=(0, 6))
+        
+        version_frame = ttk.Frame(title_container)
+        version_frame.pack(anchor="w")
+        ttk.Label(version_frame, text=f" v{app_version} ", font=("Consolas", 9, "bold"), bootstyle="info", padding=(6, 2)).pack(side=tk.LEFT)
+        
+        # ========== 分隔线 ==========
+        ttk.Separator(main_frame, orient='horizontal').pack(fill='x', pady=(0, 18))
+        
+        # ========== 中部：详细信息区域 ==========
+        info_frame = ttk.Frame(main_frame)
+        info_frame.pack(fill=tk.X, pady=(0, 18), padx=5)
+        info_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(info_frame, text="软件作者", font=("Microsoft YaHei UI", 10, "bold"), foreground="#777777").grid(row=0, column=0, sticky="w", padx=(0, 20), pady=6)
+        ttk.Label(info_frame, text="寒星", font=("Microsoft YaHei UI", 10)).grid(row=0, column=1, sticky="w", pady=6)
+        
+        ttk.Label(info_frame, text="项目主页", font=("Microsoft YaHei UI", 10, "bold"), foreground="#777777").grid(row=1, column=0, sticky="w", padx=(0, 20), pady=6)
+        link_label = ttk.Label(info_frame, text="github.com/hxlive/MacroAssistant", font=("Microsoft YaHei UI", 10), foreground="#0066CC", cursor="hand2")
+        link_label.grid(row=1, column=1, sticky="w", pady=6)
+        
+        link_label.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/hxlive/MacroAssistant/"))
+        link_label.bind("<Enter>", lambda e: link_label.config(font=("Microsoft YaHei UI", 10, "underline"), foreground="#0052A3"))
+        link_label.bind("<Leave>", lambda e: link_label.config(font=("Microsoft YaHei UI", 10), foreground="#0066CC"))
+        
+        # ========== 分隔线 ==========
+        ttk.Separator(main_frame, orient='horizontal').pack(fill='x', pady=(0, 18))
+        
+        # ========== 底部：操作按钮区域 ==========
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(button_frame, text="确  定", command=self.dialog.destroy, bootstyle="primary", width=18, padding=(15, 8)).pack(anchor="center")
+
