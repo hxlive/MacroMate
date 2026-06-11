@@ -7,6 +7,7 @@ pynput==1.8.1
 pyperclip==1.9.0
 pytesseract==0.3.13
 rapidocr==3.4.2
+onnxruntime>=1.20.0,<1.25.0
 ttkbootstrap==1.16.0
 requests==2.32.5
 winocr==0.0.15

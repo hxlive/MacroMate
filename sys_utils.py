@@ -1,6 +1,6 @@
 # sys_utils.py
 # 描述: 系统底层工具、全局热键管理及稳定工具类集
-# 版本: 1.7.1
+# 版本: 1.7.3
 
 import sys
 import os
@@ -298,7 +298,6 @@ class GlobalHotkeyManager:
                 self.root.after(0, self.trigger_stop)
         except Exception as e:
             print(f"[Hotkey] press error: {e}")
-            import traceback; traceback.print_exc()
 
     def on_release(self, key):
         try:
@@ -308,7 +307,6 @@ class GlobalHotkeyManager:
             self.held_keys.pop(key_name, None)
         except Exception as e:
             print(f"[Hotkey] release error: {e}")
-            import traceback; traceback.print_exc()
 
     @functools.lru_cache(maxsize=16)
     def _parse_hotkey(self, hotkey_str):

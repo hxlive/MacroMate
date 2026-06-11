@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # MacroAssistant.py
 # 描述: 自动化宏的 GUI 界面
-# 版本: 1.7.1
+# 版本: 1.7.3
 # 变更: 迁移部分代码至sys_utils.py和gui_utils.py,并修复一些小bug和优化了代码结构
         
 
@@ -25,7 +25,7 @@ import sys_utils  # [新增] 系统底层工具与初始化
 sys_utils.init_system_runtime() # [新增] 初始化 DPI 感知与流重定向
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import json
 import pyautogui
 import threading
@@ -40,7 +40,7 @@ import webbrowser
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.3"
 APP_TITLE = f"宏助手 (Macro Assistant) v{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 CONFIG_FILE = "macro_settings.json"
@@ -951,7 +951,7 @@ class MacroApp:
             act = step['action']
             
             # 缩进逻辑
-            current_indent_level = max(0, len(block_stack) - (1 if act in ['ELSE', 'END_IF', 'END_LOOP'] else 0))
+            current_indent_level = max(0, len(block_stack) - (1 if act in ['ELSE', 'END_IF', 'END_LOOP', 'END_FOREACH'] else 0))
             indent_str = "    " * current_indent_level
             
             # 参数预览文本
@@ -975,6 +975,60 @@ class MacroApp:
             if act == 'NOTE':
                 note_text = step['params'].get('text', '')
                 param_text = f"// {note_text}" if note_text else "// (空备注)"
+
+            if act == 'GOTO_LABEL':
+                label = step['params'].get('label', '')
+                max_jumps = step['params'].get('max_jumps', 100)
+                param_text = f"-> {label}  [最多 {max_jumps} 次]"
+            elif act == 'SET_VAR':
+                name = step['params'].get('var_name', '')
+                val = step['params'].get('var_value', '')
+                param_text = f"变量 {name} = '{val}'"
+            elif act == 'READ_FILE':
+                path = step['params'].get('file_path', '')
+                name = step['params'].get('var_name', '')
+                param_text = f"读取 '{path}' -> 变量 {name}"
+            elif act == 'EXTRACT_VAR':
+                src = step['params'].get('source_text', '')
+                name = step['params'].get('var_name', '')
+                reg = step['params'].get('regex', '')
+                param_text = f"'{src}' 提取 '{reg}' -> 变量 {name}"
+            elif act == 'JSON_EXTRACT':
+                path = step['params'].get('json_path', '')
+                name = step['params'].get('var_name', '')
+                has_default = step['params'].get('use_default') or str(step['params'].get('default_value', '')) != ''
+                fallback_text = "；失败用默认值" if has_default else ""
+                param_text = f"JSON 路径 '{path or '$'}' -> 变量 {name}{fallback_text}"
+            elif act == 'PROMPT_INPUT':
+                prompt = step['params'].get('prompt', '')
+                name = step['params'].get('var_name', '')
+                param_text = f"人工输入 '{prompt}' -> 变量 {name}"
+            elif act == 'FOREACH_LINE':
+                source = step['params'].get('file_path') or step['params'].get('source_text', '')
+                line_var = step['params'].get('current_line_var', 'current_line')
+                fields = step['params'].get('field_names', '')
+                suffix = f"；拆分为 {fields}" if fields else ""
+                param_text = f"批量处理 '{source}' -> {{{line_var}}}{suffix}"
+            elif act == 'END_FOREACH':
+                param_text = "结束批量处理"
+            elif act == 'IF_VAR':
+                val = step['params'].get('var_value', '')
+                op = step['params'].get('operator', '==')
+                exp = step['params'].get('expected_val', '')
+                param_text = f"如果 '{val}' {op} '{exp}'"
+            elif act == 'CALCULATE':
+                expr = step['params'].get('expression', '')
+                name = step['params'].get('var_name', '')
+                param_text = f"变量计算 '{expr}' -> 变量 {name}"
+            elif act == 'WRITE_FILE':
+                path = step['params'].get('file_path', '')
+                param_text = f"写入至 '{path}'"
+            elif act == 'GOTO_IF':
+                val = step['params'].get('var_value', '')
+                op = step['params'].get('operator', '==')
+                exp = step['params'].get('expected_val', '')
+                label = step['params'].get('label', '')
+                param_text = f"如果 '{val}' {op} '{exp}' -> 跳转至 {label}"
             
             # 插入行 (Values对应: id, action, params)
             is_enabled = step.get('enabled', True)
@@ -1003,9 +1057,9 @@ class MacroApp:
                 # 保持选中状态 (可选)
                 self.steps_tree.selection_set(item_id)
 
-            if act.startswith('IF_') or act == 'LOOP_START':
+            if act.startswith('IF_') or act in ('LOOP_START', 'FOREACH_LINE'):
                 block_stack.append(act)
-            elif act in ['END_IF', 'END_LOOP'] and block_stack:
+            elif act in ['END_IF', 'END_LOOP', 'END_FOREACH'] and block_stack:
                 block_stack.pop()
 
     def show_tree_menu(self, event):
@@ -1016,7 +1070,7 @@ class MacroApp:
             idx = self._get_selected_index()
             if idx is not None:
                 act = self.steps[idx].get('action', '')
-                if act in ['IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'ELSE', 'END_IF', 'LOOP_START', 'END_LOOP']:
+                if act in MacroSchema.CONTROL_FLOW_ACTIONS:
                     self.tree_menu.entryconfig("屏蔽/启用选中步骤", state="disabled")
                 else:
                     self.tree_menu.entryconfig("屏蔽/启用选中步骤", state="normal")
@@ -1028,7 +1082,7 @@ class MacroApp:
         if idx is not None:
             step = self.steps[idx]
             act = step.get('action', '')
-            if act in ['IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'ELSE', 'END_IF', 'LOOP_START', 'END_LOOP']:
+            if act in MacroSchema.CONTROL_FLOW_ACTIONS:
                 messagebox.showwarning("提示", "不可屏蔽流程控制节点（条件、循环），以防止引发严重 BUG。", parent=self.root)
                 return
             
@@ -1174,10 +1228,46 @@ class MacroApp:
             'stop_requested': False,
             'stop_key_str': self.hotkey_stop_str.get(),
             'enhanced_mode': self.enhanced_mode_var.get(),
-            'run_enabled': self.run_enabled_var.get()
+            'run_enabled': self.run_enabled_var.get(),
+            'prompt_input_callback': self._prompt_input_for_macro,
         }
         self._macro_thread = threading.Thread(target=self._run, args=(copy.deepcopy(self.steps),), daemon=True)
         self._macro_thread.start()
+
+    def _prompt_input_for_macro(self, title, prompt, default_value='', ctx=None):
+        done = threading.Event()
+        result = {'value': None}
+
+        def ask():
+            try:
+                if self.root.winfo_exists():
+                    self.root.deiconify()
+                    self.root.attributes('-topmost', True)
+                    self.root.lift()
+                result['value'] = simpledialog.askstring(
+                    title or "宏助手输入",
+                    prompt or "请输入内容:",
+                    initialvalue=default_value or "",
+                    parent=self.root
+                )
+            except Exception as e:
+                result['error'] = e
+            finally:
+                try:
+                    if self.root.winfo_exists() and self.dont_minimize_var.get():
+                        self.root.attributes('-topmost', True)
+                except Exception:
+                    pass
+                done.set()
+
+        self.root.after(0, ask)
+        while not done.wait(0.1):
+            if ctx and ctx.get('stop_requested'):
+                raise macro_engine.MacroStopException("用户在输入期间请求停止")
+
+        if 'error' in result:
+            raise result['error']
+        return result.get('value')
         
     def _run(self, steps):
         try:
