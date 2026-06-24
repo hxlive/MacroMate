@@ -1,6 +1,6 @@
 # sys_utils.py
 # 描述: 系统底层工具、全局热键管理及稳定工具类集
-# 版本: 1.7.3
+# 版本: 1.8.0
 
 import sys
 import os
@@ -25,11 +25,15 @@ def init_system_runtime():
     if sys.platform == 'win32':
         # 1. 重构标准输出编码
         #    优先级：
-        #    1) MACROASSISTANT_STDIO_ENCODING（--log-encoding 显式覆盖）
+        #    1) MACROMATE_STDIO_ENCODING（--log-encoding 显式覆盖）
         #    2) UTF-8（兼容现代终端与工具输出捕获，Windows 10+ 控制台原生支持）
         #    Python 默认编码在 Windows 管道场景下常为 GBK，导致 UTF-8 终端显示乱码
         try:
-            stdio_encoding = os.environ.get('MACROASSISTANT_STDIO_ENCODING') or 'utf-8'
+            stdio_encoding = (
+                os.environ.get('MACROMATE_STDIO_ENCODING')
+                or os.environ.get('MACROASSISTANT_STDIO_ENCODING')
+                or 'utf-8'
+            )
             sys.stdout.reconfigure(encoding=stdio_encoding, errors='replace')
             sys.stderr.reconfigure(encoding=stdio_encoding, errors='replace')
             print(f"[CONFIG] STDIO encoding: {stdio_encoding}")
@@ -54,7 +58,7 @@ def set_windows_app_id(app_version):
     if sys.platform == 'win32':
         try:
             import ctypes
-            myappid = f'hxlive.macroassistant.{app_version}'
+            myappid = f'hxlive.macromate.{app_version}'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
             return True
         except Exception as e:
@@ -82,30 +86,39 @@ class MouseTracker:
         self.var = tk_var
         self.job = None
         self.is_running = False
+        self._lock = threading.RLock()
 
     def start(self):
-        if not self.is_running:
+        with self._lock:
+            if self.is_running:
+                return
             self.is_running = True
-            self._update()
+        self._update()
 
     def stop(self):
-        self.is_running = False
-        if self.job:
+        with self._lock:
+            self.is_running = False
+            job = self.job
+            self.job = None
+        if job:
             try:
-                self.root.after_cancel(self.job)
+                self.root.after_cancel(job)
             except Exception:
                 pass
-            self.job = None
-            self.var.set("")
+        self.var.set("")
 
     def _update(self):
-        if not self.is_running: return
+        with self._lock:
+            if not self.is_running:
+                return
         try:
             x, y = pyautogui.position()
             self.var.set(f"X: {x}, Y: {y}")
         except Exception:
             self.var.set("未知")
-        self.job = self.root.after(100, self._update)
+        with self._lock:
+            if self.is_running:
+                self.job = self.root.after(100, self._update)
 
 # ======================================================================
 # 4. 区域选择器 (RegionSelector)
@@ -115,6 +128,8 @@ class RegionSelector:
         self.master = master
         self.selection = None
         self.is_selecting = False
+        self.has_dragged = False
+        self.rect = None
         self.start_x = 0; self.start_y = 0; self.cur_x = 0; self.cur_y = 0
 
         # 获取虚拟显示器的联合（Virtual Screen）坐标，以完美覆盖多屏
@@ -164,7 +179,7 @@ class RegionSelector:
         self._finalize_selection()
 
     def _finalize_selection(self):
-        if self.cur_x != 0 or self.cur_y != 0:
+        if getattr(self, 'has_dragged', self.cur_x != 0 or self.cur_y != 0):
             x1, y1 = min(self.start_x, self.cur_x) + self.offset_x, min(self.start_y, self.cur_y) + self.offset_y
             x2, y2 = max(self.start_x, self.cur_x) + self.offset_x, max(self.start_y, self.cur_y) + self.offset_y
             if abs(x2 - x1) > 5 and abs(y2 - y1) > 5:
@@ -181,6 +196,7 @@ class RegionSelector:
 
     def _on_drag(self, event):
         if self.is_selecting:
+            self.has_dragged = True
             self.cur_x, self.cur_y = event.x, event.y
             self.canvas.coords(self.rect, self.start_x, self.start_y, self.cur_x, self.cur_y)
 
@@ -209,28 +225,48 @@ class GlobalHotkeyManager:
         self.trigger_run = trigger_run_cb
         self.trigger_stop = trigger_stop_cb
         
+        # 缓存快捷键字符串，避免多线程直接调用 Tk 控件
+        self.run_hotkey_cache = ""
+        self.stop_hotkey_cache = ""
+        
         self.held_keys = {}
         self.listener = None
+        self._listener_lock = threading.RLock()
         
     def start_listener(self):
-        """启动监听器线程"""
-        old_listener = self.listener
-        if self.listener:
-            try:
-                self.listener.stop()
-                self.listener.join(timeout=0.5)
-            except Exception as e:
-                print(f"[Hotkey] stop old listener failed: {e}")
-        if self.listener is old_listener:
-            self.listener = None
-        self.held_keys.clear()
-        threading.Thread(target=self._listener_thread, daemon=True).start()
+        """Start or restart the global hotkey listener."""
+        # Read Tk-backed hotkey values on the main thread before listener callbacks use them.
+        try:
+            run_cache = self.get_run_str()
+        except Exception:
+            run_cache = ""
+        try:
+            stop_cache = self.get_stop_str()
+        except Exception:
+            stop_cache = ""
+
+        with self._listener_lock:
+            self.run_hotkey_cache = run_cache
+            self.stop_hotkey_cache = stop_cache
+            old_listener = self.listener
+            if self.listener:
+                try:
+                    self.listener.stop()
+                    self.listener.join(timeout=0.5)
+                except Exception as e:
+                    print(f"[Hotkey] stop old listener failed: {e}")
+            if self.listener is old_listener:
+                self.listener = None
+            self.held_keys.clear()
+            threading.Thread(target=self._listener_thread, daemon=True).start()
         
     def _listener_thread(self):
         try:
-            self.listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
-            self.listener.start()
-            self.listener.join()
+            listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
+            with self._listener_lock:
+                self.listener = listener
+            listener.start()
+            listener.join()
         except Exception as e:
             msg = f"热键监听器启动失败: {e}\n\n快捷键将无法工作。请尝试重启程序。"
             self.root.after(0, messagebox.showerror, "严重错误", msg)
@@ -290,10 +326,11 @@ class GlobalHotkeyManager:
                 return
                 
             self.held_keys[key_name] = 1
-            run_mods, run_key = self._parse_hotkey(self.get_run_str())
+            # 从本地缓存读取快捷键配置，避免跨线程直接调用 Tk 控件
+            run_mods, run_key = self._parse_hotkey(self.run_hotkey_cache)
             if key_name == run_key and self._modifiers_satisfied(run_mods):
                 self.root.after(0, self.trigger_run)
-            stop_mods, stop_key = self._parse_hotkey(self.get_stop_str())
+            stop_mods, stop_key = self._parse_hotkey(self.stop_hotkey_cache)
             if key_name == stop_key and self._modifiers_satisfied(stop_mods):
                 self.root.after(0, self.trigger_stop)
         except Exception as e:
@@ -581,7 +618,9 @@ class HotkeySettingsDialog:
         if not parts:
             return False
         if len(parts) == 1:
-            p = parts[0]
+            p = parts[0].strip().lower()
+            if len(p) == 1 and 'a' <= p <= 'z':
+                return True
             if p.startswith('f') and p[1:].isdigit():
                 return int(p[1:]) in range(1, 13)
             return False
@@ -721,9 +760,13 @@ class VLMSettingsDialog:
 
             # 禁用按钮并显示等待状态（UI 层立即响应）
             self.dialog.config(cursor="watch")
+            original_states = {}
             for child in self.dialog.winfo_children():
-                try: child.config(state="disabled")
-                except Exception: pass
+                try:
+                    original_states[child] = child.cget("state")
+                    child.config(state="disabled")
+                except Exception:
+                    pass
             self.dialog.update()
 
             def _do_test():
@@ -735,10 +778,10 @@ class VLMSettingsDialog:
                     screenshot.save(buf, format='JPEG', quality=85)
                     image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
                     vlm_engine.call_vlm_api("描述你看到了什么？", image_b64=image_b64, config=config, raise_on_error=True)
-                    self.dialog.after(0, lambda: messagebox.showinfo("成功", "API 连接成功！", parent=self.dialog))
+                    self._safe_dialog_after(lambda: messagebox.showinfo("成功", "API 连接成功！", parent=self.dialog))
                 except Exception as e:
                     err = str(e)
-                    self.dialog.after(0, lambda msg=err: messagebox.showerror("错误", f"连接失败:\n{msg}", parent=self.dialog))
+                    self._safe_dialog_after(lambda msg=err: messagebox.showerror("错误", f"连接失败:\n{msg}", parent=self.dialog))
                 finally:
                     if screenshot:
                         try: screenshot.close()
@@ -748,17 +791,24 @@ class VLMSettingsDialog:
                         try:
                             self.dialog.config(cursor="")
                             for child in self.dialog.winfo_children():
-                                try: child.config(state="normal")
+                                try: child.config(state=original_states.get(child, "normal"))
                                 except Exception: pass
                         except Exception:
                             pass
-                    self.dialog.after(0, _restore)
+                    self._safe_dialog_after(_restore)
 
             threading.Thread(target=_do_test, daemon=True).start()
 
         except Exception as e:
             messagebox.showerror("错误", f"启动测试失败: {e}", parent=self.dialog)
             self.dialog.config(cursor="")
+
+    def _safe_dialog_after(self, callback):
+        try:
+            if self.dialog.winfo_exists():
+                self.dialog.after(0, callback)
+        except Exception:
+            pass
 
     def _save(self):
         try:
@@ -878,9 +928,25 @@ class MiniStatusWindow:
         px, py = self.window.winfo_pointerxy()
         screen_width = self.window.winfo_screenwidth()
         screen_height = self.window.winfo_screenheight()
-        monitor_x = (px // screen_width) * screen_width if screen_width > 0 else 0
-        monitor_y = (py // screen_height) * screen_height if screen_height > 0 else 0
-        self.window.geometry(f"{window_width}x{window_height}+{monitor_x + 10}+{monitor_y + screen_height - window_height - 50}")
+        monitor_x = self.window.winfo_vrootx()
+        monitor_y = self.window.winfo_vrooty()
+        monitor_w = self.window.winfo_vrootwidth() or screen_width
+        monitor_h = self.window.winfo_vrootheight() or screen_height
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                vx = user32.GetSystemMetrics(76)
+                vy = user32.GetSystemMetrics(77)
+                vw = user32.GetSystemMetrics(78)
+                vh = user32.GetSystemMetrics(79)
+                if vw > 0 and vh > 0 and vx <= px < vx + vw and vy <= py < vy + vh:
+                    monitor_x, monitor_y, monitor_w, monitor_h = vx, vy, vw, vh
+            except Exception:
+                pass
+        x = monitor_x + 10
+        y = monitor_y + max(0, monitor_h - window_height - 50)
+        self.window.geometry(f"{window_width}x{window_height}+{x}+{y}")
 
         main_frame = ttk.Frame(self.window, bootstyle="primary", padding=0)
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -925,7 +991,7 @@ class MiniStatusWindow:
             pass
 
 class AboutDialog:
-    """宏助手关于对话框"""
+    """智点助手关于对话框"""
     def __init__(self, parent, app_version, icon_path=None):
         self.parent = parent
         
@@ -1002,8 +1068,8 @@ class AboutDialog:
         title_container = ttk.Frame(top_frame)
         title_container.pack(side=tk.LEFT, pady=10)
         
-        ttk.Label(title_container, text="宏助手", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w", pady=(0, 2))
-        ttk.Label(title_container, text="Macro Assistant", font=("Microsoft YaHei UI", 10), foreground="#666666").pack(anchor="w", pady=(0, 6))
+        ttk.Label(title_container, text="智点助手", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Label(title_container, text="MacroMate", font=("Microsoft YaHei UI", 10), foreground="#666666").pack(anchor="w", pady=(0, 6))
         
         version_frame = ttk.Frame(title_container)
         version_frame.pack(anchor="w")
@@ -1021,10 +1087,10 @@ class AboutDialog:
         ttk.Label(info_frame, text="寒星", font=("Microsoft YaHei UI", 10)).grid(row=0, column=1, sticky="w", pady=6)
         
         ttk.Label(info_frame, text="项目主页", font=("Microsoft YaHei UI", 10, "bold"), foreground="#777777").grid(row=1, column=0, sticky="w", padx=(0, 20), pady=6)
-        link_label = ttk.Label(info_frame, text="github.com/hxlive/MacroAssistant", font=("Microsoft YaHei UI", 10), foreground="#0066CC", cursor="hand2")
+        link_label = ttk.Label(info_frame, text="github.com/hxlive/MacroMate", font=("Microsoft YaHei UI", 10), foreground="#0066CC", cursor="hand2")
         link_label.grid(row=1, column=1, sticky="w", pady=6)
         
-        link_label.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/hxlive/MacroAssistant/"))
+        link_label.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/hxlive/MacroMate/"))
         link_label.bind("<Enter>", lambda e: link_label.config(font=("Microsoft YaHei UI", 10, "underline"), foreground="#0052A3"))
         link_label.bind("<Leave>", lambda e: link_label.config(font=("Microsoft YaHei UI", 10), foreground="#0066CC"))
         
@@ -1035,4 +1101,6 @@ class AboutDialog:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(button_frame, text="确  定", command=self.dialog.destroy, bootstyle="primary", width=18, padding=(15, 8)).pack(anchor="center")
+
+
 

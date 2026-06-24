@@ -55,10 +55,11 @@ def preload_engines():
 def get_rapid_ocr_engine():
     global _RAPID_OCR_INSTANCE, _RAPID_OCR_INIT_FAILED
     if _RAPID_OCR_INSTANCE: return _RAPID_OCR_INSTANCE
-    if _RAPID_OCR_INIT_FAILED or not RAPIDOCR_CLASS: return None
+    if not RAPIDOCR_CLASS: return None
     
     with _RAPID_OCR_LOCK: 
         if _RAPID_OCR_INSTANCE: return _RAPID_OCR_INSTANCE
+        if _RAPID_OCR_INIT_FAILED: return None
         try:
             print("[OCR] 正在加载 RapidOCR 模型...")
             t0 = time.time()
@@ -110,7 +111,9 @@ def get_tesseract_cmd():
             try:
                 import pytesseract
                 pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
-            except: _TESSERACT_CMD = None
+            except Exception as e:
+                print(f"[OCR] pytesseract 加载失败: {e}")
+                _TESSERACT_CMD = None
             
         return _TESSERACT_CMD
 
@@ -258,10 +261,34 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
         if debug: print(f"  [统计] {ocr_stats.get_stats()}")
         return None
     finally:
-        if _should_close_screenshot and screenshot_pil:
+        if _should_close_screenshot and screenshot_pil is not None:
             try: screenshot_pil.close()
             except Exception: pass
 
+
+def _match_words(words, target_norm, offset, full_text, debug, center_from_boxes, single_debug, merged_debug):
+    """Match a normalized target in OCR words and return the absolute center plus full text."""
+    for word in words:
+        if target_norm in word['text']:
+            cx, cy = center_from_boxes([word['box']], offset)
+            if debug:
+                print(single_debug.format(cx=cx, cy=cy, word=word, score=word.get('score', 0.0)))
+            return ((cx, cy), full_text)
+
+    for i in range(len(words)):
+        merged = words[i]['text']
+        if not target_norm.startswith(merged):
+            continue
+        boxes = [words[i]['box']]
+        for j in range(i + 1, min(i + MAX_MERGE_WORDS, len(words))):
+            merged += words[j]['text']
+            boxes.append(words[j]['box'])
+            if target_norm == merged:
+                cx, cy = center_from_boxes(boxes, offset)
+                if debug:
+                    print(merged_debug.format(cx=cx, cy=cy))
+                return ((cx, cy), full_text)
+    return None
 # --- 具体实现函数 (修改为返回完整文本) ---
 def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_pil, offset):
     try:
@@ -280,28 +307,15 @@ def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_p
         
         full_text = ' '.join(all_texts)
         
-        # 单词匹配
-        for w in words:
-            if target_norm in w['text']:
-                b = w['box']
-                cx, cy = offset[0]+b['x']+b['width']//2, offset[1]+b['y']+b['height']//2
-                if debug: print(f"  [WinOCR OK] ({cx}, {cy})")
-                return ((cx, cy), full_text)
-        
-        # 多词合并匹配
-        for i in range(len(words)):
-            merged = words[i]['text']
-            if not target_norm.startswith(merged): continue
-            b_list = [words[i]['box']]
-            for j in range(i+1, min(i+MAX_MERGE_WORDS, len(words))):
-                merged += words[j]['text']
-                b_list.append(words[j]['box'])
-                if target_norm == merged:
-                    cx = offset[0] + sum(b['x']+b['width']//2 for b in b_list)//len(b_list)
-                    cy = offset[1] + sum(b['y']+b['height']//2 for b in b_list)//len(b_list)
-                    if debug: print(f"  [WinOCR OK] 合并 ({cx}, {cy})")
-                    return ((cx, cy), full_text)
-        return None
+        return _match_words(
+            words, target_norm, offset, full_text, debug,
+            lambda boxes, off: (
+                off[0] + sum(b['x'] + b['width']//2 for b in boxes)//len(boxes),
+                off[1] + sum(b['y'] + b['height']//2 for b in boxes)//len(boxes),
+            ),
+            "  [WinOCR OK] ({cx}, {cy})",
+            "  [WinOCR OK] 合并 ({cx}, {cy})",
+        )
     except Exception as e:
         print(f"  [WinOCR] 异常: {e}")
         return None
@@ -359,28 +373,15 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset, enha
                 'original': text
             })
 
-        # 单词匹配
-        for w in words:
-            if target_norm in w['text']:
-                b = w['box']
-                cx, cy = offset[0] + ((b[0]+b[2])//2)//scale, offset[1] + ((b[1]+b[3])//2)//scale
-                if debug: print(f"  [RapidOCR OK] ({cx}, {cy}) @ {w['score']:.2f}")
-                return ((cx, cy), full_text)
-        
-        # 多词合并匹配
-        for i in range(len(words)):
-            merged = words[i]['text']
-            if not target_norm.startswith(merged): continue
-            b_list = [words[i]['box']]
-            for j in range(i+1, min(i+MAX_MERGE_WORDS, len(words))):
-                merged += words[j]['text']
-                b_list.append(words[j]['box'])
-                if target_norm == merged:
-                    cx = offset[0] + (sum((b[0]+b[2])//2 for b in b_list)//len(b_list)) // scale
-                    cy = offset[1] + (sum((b[1]+b[3])//2 for b in b_list)//len(b_list)) // scale
-                    if debug: print(f"  [RapidOCR OK] 合并 ({cx}, {cy})")
-                    return ((cx, cy), full_text)
-        return None
+        return _match_words(
+            words, target_norm, offset, full_text, debug,
+            lambda boxes, off: (
+                off[0] + (sum((b[0]+b[2])//2 for b in boxes)//len(boxes)) // scale,
+                off[1] + (sum((b[1]+b[3])//2 for b in boxes)//len(boxes)) // scale,
+            ),
+            "  [RapidOCR OK] ({cx}, {cy}) @ {score:.2f}",
+            "  [RapidOCR OK] 合并 ({cx}, {cy})",
+        )
     except Exception as e:
         if debug: print(f"  [RapidOCR] 解析错误: {e}")
         return None
@@ -409,7 +410,7 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset, enhan
         
         config = f'-l {lang}'
         if _TESSERACT_TESSDATA: 
-            config += f' --tessdata-dir {_TESSERACT_TESSDATA}'
+            config += f' --tessdata-dir "{_TESSERACT_TESSDATA}"'
         
         for psm in [6, 11, 3]:
             data = pytesseract.image_to_data(img_processed, config=config + f' --psm {psm}', output_type=pytesseract.Output.DICT)
@@ -434,37 +435,27 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset, enhan
             
             if debug: print(f"  [Tesseract] PSM {psm} 识别 {len(words)} 词")
 
-            # 单词匹配
-            for w in words:
-                if target_norm in w['text']:
-                    b = w['box'] 
-                    cx, cy = offset[0]+(b[0]+b[2])//2, offset[1]+(b[1]+b[3])//2
-                    if debug: print(f"  [Tesseract OK] (PSM {psm}) ({cx}, {cy})")
-                    return ((cx, cy), full_text)
-            
-            # 多词合并匹配
-            for i in range(len(words)):
-                merged = words[i]['text']
-                if not target_norm.startswith(merged): continue
-                b_list = [words[i]['box']]
-                for j in range(i+1, min(i+MAX_MERGE_WORDS, len(words))):
-                    merged += words[j]['text']
-                    b_list.append(words[j]['box'])
-                    if target_norm == merged:
-                        cx = offset[0] + sum((b[0]+b[2])//2 for b in b_list)//len(b_list)
-                        cy = offset[1] + sum((b[1]+b[3])//2 for b in b_list)//len(b_list)
-                        if debug: print(f"  [Tesseract OK] (PSM {psm}) 合并 ({cx}, {cy})")
-                        return ((cx, cy), full_text)
+            result = _match_words(
+                words, target_norm, offset, full_text, debug,
+                lambda boxes, off: (
+                    off[0] + sum((b[0]+b[2])//2 for b in boxes)//len(boxes),
+                    off[1] + sum((b[1]+b[3])//2 for b in boxes)//len(boxes),
+                ),
+                f"  [Tesseract OK] (PSM {psm}) ({{cx}}, {{cy}})",
+                f"  [Tesseract OK] (PSM {psm}) 合并 ({{cx}}, {{cy}})",
+            )
+            if result:
+                return result
                         
         return None
     except Exception as e: 
         if debug: print(f"[Tesseract Error] {e}")
         return None
     finally:
-        if 'img_processed' in locals() and img_processed:
+        if 'img_processed' in locals() and img_processed is not None:
             try: img_processed.close()
             except Exception: pass
-        if 'g' in locals() and g and g is not screenshot_pil:
+        if 'g' in locals() and g is not None and g is not screenshot_pil:
             try: g.close()
             except Exception: pass
 
@@ -490,3 +481,4 @@ def get_available_engines():
     return engines
 
 ocr_engine_version = "1.7.1"
+

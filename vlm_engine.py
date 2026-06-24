@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vlm_engine.py
 # 描述: 大模型视觉语言引擎 - 接入支持图片理解的大模型 API
-# 版本: 1.1.1
+# 版本: 1.1.2
 # 功能: 将屏幕截图转为 Base64，连同自然语言指令发送给 VLM API，返回坐标
 
 import base64
@@ -25,8 +25,8 @@ from PIL import Image, ImageGrab
 # ======================================================================
 # 全局配置
 # ======================================================================
-APP_CONFIG_FILE = "macro_settings.json"
-VLM_CONFIG_FILE = "vlm_settings.json"
+APP_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "macro_settings.json")
+VLM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_settings.json")
 VLM_CONFIG_KEY = "vlm"
 
 # 默认配置
@@ -99,7 +99,7 @@ def _read_json_file(path):
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
-    except Exception as e:
+    except (OSError, json.JSONDecodeError, TypeError) as e:
         print(f"[VLM] 加载配置失败 ({path}): {e}")
         return {}
 
@@ -168,7 +168,7 @@ def save_config(config):
             os.replace(tmp_path, APP_CONFIG_FILE)
             _vlm_config = config
             return True
-        except Exception as e:
+        except (OSError, TypeError) as e:
             print(f"[VLM] 保存配置失败: {e}")
             return False
 
@@ -292,13 +292,13 @@ def parse_coordinates(response_text):
     
     # 尝试多种匹配模式
     patterns = [
-        r'(\d+)\s*[,，]\s*(\d+)\s*[,，]\s*(\d+)\s*[,，]\s*(\d+)',  # 4个坐标: 899,1326,924,1344
-        r'(\d+)\s*[,，]\s*(\d+)',           # 2个坐标: 123,456 或 123，456
-        r'x\s*[:=]\s*(\d+)\s*[,，]?\s*y\s*[:=]\s*(\d+)',  # x:123, y:456
-        r'(\d+)\s*[,，]\s*(\d+).*(?:坐标|location)',  # 123,456 坐标
-        r'位于\s*[（(]?\s*(\d+)\s*[,，]\s*(\d+)\s*[）)]?',  # 位于 (123,456)
-        r'(\d+)px?\s*[,，]\s*(\d+)px?',     # 带单位: 123px, 456px
-        r'^\s*(?:coordinate|position|location|point)?\s*[:：]?\s*(\d+)\s+(\d+)\s*$',  # 整段只有一个空格分隔坐标
+        r'(-?\d+)\s*[,，]\s*(-?\d+)\s*[,，]\s*(-?\d+)\s*[,，]\s*(-?\d+)',  # 4个坐标: 899,1326,924,1344
+        r'(-?\d+)\s*[,，]\s*(-?\d+)',           # 2个坐标: 123,456 或 123，456
+        r'x\s*[:=]\s*(-?\d+)\s*[,，]?\s*y\s*[:=]\s*(-?\d+)',  # x:123, y:456
+        r'(-?\d+)\s*[,，]\s*(-?\d+).*(?:坐标|location)',  # 123,456 坐标
+        r'位于\s*[（(]?\s*(-?\d+)\s*[,，]\s*(-?\d+)\s*[）)]?',  # 位于 (123,456)
+        r'(-?\d+)px?\s*[,，]\s*(-?\d+)px?',     # 带单位: 123px, 456px
+        r'^\s*(?:coordinate|position|location|point)?\s*[:：]?\s*(-?\d+)\s+(-?\d+)\s*$',  # 整段只有一个空格分隔坐标
     ]
     
     for pattern in patterns:
@@ -308,7 +308,7 @@ def parse_coordinates(response_text):
                 groups = match.groups()
                 if len(groups) == 4:
                     x1, y1, x2, y2 = int(groups[0]), int(groups[1]), int(groups[2]), int(groups[3])
-                    if 0 <= x1 <= 10000 and 0 <= y1 <= 10000 and 0 <= x2 <= 10000 and 0 <= y2 <= 10000:
+                    if -10000 <= x1 <= 10000 and -10000 <= y1 <= 10000 and -10000 <= x2 <= 10000 and -10000 <= y2 <= 10000:
                         cx = (x1 + x2) // 2
                         cy = (y1 + y2) // 2
                         return (cx, cy)
@@ -316,8 +316,8 @@ def parse_coordinates(response_text):
                     # 2个坐标
                     x = int(groups[0])
                     y = int(groups[1])
-                    # 合理性检查 (屏幕坐标通常在 0-10000 范围内)
-                    if 0 <= x <= 10000 and 0 <= y <= 10000:
+                    # 合理性检查 (屏幕坐标通常在 -10000 到 10000 范围内，放宽以支持多屏和负坐标)
+                    if -10000 <= x <= 10000 and -10000 <= y <= 10000:
                         return (x, y)
             except (ValueError, IndexError):
                 continue
@@ -328,444 +328,240 @@ def parse_coordinates(response_text):
 # ======================================================================
 # API 调用
 # ======================================================================
+# API call adapters
+# ======================================================================
+class _OpenAICompatibleAdapter:
+    endpoint = "/chat/completions"
+    include_system = True
+    max_tokens = 100
+    image_order = "text_first"
+    extra_headers = None
+
+    @classmethod
+    def build_request(cls, instruction, image_b64, cfg):
+        headers = {
+            "Authorization": f"Bearer {cfg.get('api_key', '')}",
+            "Content-Type": "application/json",
+        }
+        if cls.extra_headers:
+            headers.update(cls.extra_headers)
+
+        messages = []
+        system_prompt = cfg.get('system_prompt', DEFAULT_CONFIG['system_prompt'])
+        if cls.include_system:
+            messages.append({"role": "system", "content": system_prompt})
+
+        if image_b64:
+            text_part = {"type": "text", "text": instruction}
+            image_part = {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+            }
+            content = [text_part, image_part] if cls.image_order == "text_first" else [image_part, text_part]
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": instruction})
+
+        payload = {"model": cfg.get('model', ''), "messages": messages}
+        if cls.max_tokens is not None:
+            payload["max_tokens"] = cls.max_tokens
+        return f"{cfg.get('base_url', '')}{cls.endpoint}", headers, payload
+
+    @staticmethod
+    def parse_response(result):
+        choices = result.get('choices', [])
+        if choices:
+            msg = choices[0].get('message', {})
+            return msg.get('content', '')
+        return ""
+
+
+class _AnthropicAdapter:
+    @staticmethod
+    def build_request(instruction, image_b64, cfg):
+        headers = {
+            "x-api-key": cfg.get('api_key', ''),
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": cfg.get('model', ''),
+            "max_tokens": 100,
+            "system": cfg.get('system_prompt', DEFAULT_CONFIG['system_prompt']),
+        }
+        if image_b64:
+            payload["messages"] = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64,
+                        },
+                    },
+                ],
+            }]
+        else:
+            payload["messages"] = [{"role": "user", "content": instruction}]
+        return f"{cfg.get('base_url', '')}/messages", headers, payload
+
+    @staticmethod
+    def parse_response(result):
+        content = result.get('content', [])
+        if content and isinstance(content, list):
+            return content[0].get('text', '')
+        return ""
+
+
+class _DeepSeekAdapter(_OpenAICompatibleAdapter):
+    image_order = "image_first"
+
+
+class _ZhipuAdapter(_OpenAICompatibleAdapter):
+    include_system = False
+    max_tokens = None
+    image_order = "image_first"
+
+
+class _QianwenAdapter(_OpenAICompatibleAdapter):
+    image_order = "image_first"
+
+
+class _StepAdapter(_OpenAICompatibleAdapter):
+    include_system = False
+    image_order = "image_first"
+
+
+class _OpenRouterAdapter(_OpenAICompatibleAdapter):
+    extra_headers = {
+        "HTTP-Referer": "https://github.com/hxlive/MacroMate",
+        "X-Title": "MacroMate",
+    }
+
+
+VLM_ADAPTERS = {
+    "openai": _OpenAICompatibleAdapter,
+    "anthropic": _AnthropicAdapter,
+    "deepseek": _DeepSeekAdapter,
+    "zhipu": _ZhipuAdapter,
+    "qianwen": _QianwenAdapter,
+    "step": _StepAdapter,
+    "openrouter": _OpenRouterAdapter,
+}
+
+
+def _encode_screenshot_pil(screenshot_pil):
+    import io
+    buffer = io.BytesIO()
+    screenshot_pil.save(buffer, format='JPEG', quality=85)
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+
+def _resolve_vlm_image_b64(image_b64, screenshot_pil, raise_on_error):
+    if image_b64 or not screenshot_pil:
+        return image_b64
+    try:
+        return _encode_screenshot_pil(screenshot_pil)
+    except Exception as e:
+        err_msg = f"[VLM] FAIL image encoding failed: {e}"
+        print(err_msg)
+        if raise_on_error: raise RuntimeError(err_msg) from e
+        return None
+
+
+def _validate_vlm_capability(provider, model, image_b64, raise_on_error):
+    if not image_b64:
+        print("[VLM] text-only mode")
+        return True
+    if PROVIDER_CONFIGS.get(provider, {}).get('supports_vision') is False:
+        msg = f"current model does not support image input: {provider}/{model}"
+        print(f"[VLM] FAIL {msg}")
+        if raise_on_error:
+            raise ValueError(msg)
+        return False
+    return True
+
+
+def _parse_vlm_response_json(response, raise_on_error):
+    try:
+        return response.json()
+    except ValueError as e:
+        err_msg = f"[VLM] FAIL API returned invalid JSON: {e}"
+        print(err_msg)
+        if raise_on_error: raise RuntimeError(err_msg) from e
+        return None
+
+
 def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, raise_on_error=False):
-    """
-    调用 VLM API 获取坐标
-    
-    Args:
-        instruction: 自然语言指令，如 "点击确定按钮"
-        image_b64: Base64 编码的图片 (可选)
-        screenshot_pil: PIL 图片对象 (可选，会自动转为 Base64)
-        config: 配置字典 (可选，默认从文件加载)
-        
-    Returns:
-        (x, y) 坐标或 None
-    """
+    """Call the configured VLM API and return an (x, y) coordinate or None."""
     if not REQUESTS_AVAILABLE:
-        err_msg = "[VLM] FAIL requests 库不可用，无法调用 API"
+        err_msg = "[VLM] FAIL requests package is unavailable"
         print(err_msg)
         if raise_on_error: raise RuntimeError(err_msg)
         return None
-    
+
     cfg = config if config else load_config()
-    
     if not cfg.get('api_key'):
-        err_msg = "[VLM] FAIL 未设置 API Key"
+        err_msg = "[VLM] FAIL API key is not configured"
         print(err_msg)
         if raise_on_error: raise ValueError(err_msg)
         return None
-    
+
     provider = cfg.get('provider', 'openai')
-    api_key = cfg.get('api_key', '')
-    base_url = cfg.get('base_url', '')
     model = cfg.get('model', '')
     timeout = cfg.get('timeout', 30)
-    system_prompt = cfg.get('system_prompt', DEFAULT_CONFIG['system_prompt'])
-    
-    # 如果没有提供 Base64，尝试从 PIL 图片获取
-    if not image_b64 and screenshot_pil:
-        try:
-            import io
-            buffer = io.BytesIO()
-            screenshot_pil.save(buffer, format='JPEG', quality=85)
-            image_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        except Exception as e:
-            print(f"[VLM] 图片编码失败: {e}")
-            if raise_on_error: raise RuntimeError(f"图片编码失败: {e}")
-            return None
-    
-    if not image_b64:
-        # 允许纯文本请求（用于测试连接）
-        print("[VLM] 无图片，纯文本模式")
-    elif PROVIDER_CONFIGS.get(provider, {}).get('supports_vision') is False:
-        raise ValueError(f"当前选中的模型不支持图像输入: {provider}/{model}")
-    
-    # 构建请求
-    headers = {}
-    payload = {}
-    
-    if provider == "openai":
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        if image_b64:
-            # 带图片的请求
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": instruction
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_b64}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 100
-            }
-        else:
-            # 纯文本请求（测试用）
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": instruction
-                    }
-                ],
-                "max_tokens": 100
-            }
-        url = f"{base_url}/chat/completions"
-        
-    elif provider == "anthropic":
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json"
-        }
-        if image_b64:
-            payload = {
-                "model": model,
-                "max_tokens": 100,
-                "system": system_prompt,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": instruction
-                            },
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/jpeg",
-                                    "data": image_b64
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-        else:
-            payload = {
-                "model": model,
-                "max_tokens": 100,
-                "system": system_prompt,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": instruction
-                    }
-                ]
-            }
-        url = f"{base_url}/messages"
-        
-    elif provider == "deepseek":
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        if image_b64:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_b64}"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": instruction
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 100
-            }
-        else:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": instruction
-                    }
-                ],
-                "max_tokens": 100
-            }
-        url = f"{base_url}/chat/completions"
-        
-    elif provider == "zhipu":
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        if image_b64:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_b64}"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": instruction
-                            }
-                        ]
-                    }
-                ]
-            }
-        else:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": instruction
-                    }
-                ]
-            }
-        url = f"{base_url}/chat/completions"
-        
-    elif provider == "qianwen":
-        # 使用 DashScope OpenAI 兼容模式端点 (compatible-mode/v1)
-        # 该端点完全兼容 OpenAI API 格式，使用标准 messages 结构
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        if image_b64:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_b64}"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": instruction
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 100
-            }
-        else:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": instruction
-                    }
-                ],
-                "max_tokens": 100
-            }
-        url = f"{base_url}/chat/completions"
-        
-    elif provider == "step":
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        if image_b64:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_b64}"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": instruction
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 100
-            }
-        else:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": instruction
-                    }
-                ],
-                "max_tokens": 100
-            }
-        url = f"{base_url}/chat/completions"
-        
-    elif provider == "openrouter":
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/hxlive/MacroAssistant",
-            "X-Title": "MacroAssistant"
-        }
-        
-        if image_b64:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": instruction
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_b64}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 100
-            }
-        else:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": instruction
-                    }
-                ],
-                "max_tokens": 100
-            }
-        url = f"{base_url}/chat/completions"
-    
-    else:
-        print(f"[VLM] FAIL 不支持的提供商: {provider}")
+    adapter = VLM_ADAPTERS.get(provider)
+    if not adapter:
+        print(f"[VLM] FAIL unsupported provider: {provider}")
         return None
-    
-    # 发送请求
+
+    image_b64 = _resolve_vlm_image_b64(image_b64, screenshot_pil, raise_on_error)
+    if screenshot_pil and not image_b64:
+        return None
+    if not _validate_vlm_capability(provider, model, image_b64, raise_on_error):
+        return None
+
+    url, headers, payload = adapter.build_request(instruction, image_b64, cfg)
+
     try:
         t0 = time.time()
         response = requests.post(url, headers=headers, json=payload, timeout=timeout)
         elapsed = time.time() - t0
-        
+
         if response.status_code != 200:
-            error_text = (response.text or '').replace('\r', ' ').replace('\n', ' ')
-            if len(error_text) > 1000:
-                error_text = error_text[:1000] + "...(truncated)"
-            err_msg = f"[VLM] API 返回错误: {response.status_code} - {error_text}"
+            reason = getattr(response, 'reason', '') or 'request failed'
+            err_msg = f"[VLM] API returned error: {response.status_code} - {reason}"
             print(err_msg)
             if raise_on_error: raise RuntimeError(err_msg)
             return None
-        
-        # 解析响应
-        result = response.json()
-        
-        # 提取文本
-        text_content = ""
-        if provider in ("openai", "deepseek", "qianwen", "openrouter", "step"):
-            choices = result.get('choices', [])
-            if choices:
-                msg = choices[0].get('message', {})
-                text_content = msg.get('content', '')
-        elif provider == "anthropic":
-            content = result.get('content', [])
-            if content and isinstance(content, list):
-                text_content = content[0].get('text', '')
-        elif provider == "zhipu":
-            choices = result.get('choices', [])
-            if choices:
-                msg = choices[0].get('message', {})
-                text_content = msg.get('content', '')
-        
-        # 打印完整调试信息
-        print(f"[VLM] 原始响应: {result}")
-        if not text_content:
-            print(f"[VLM] API 返回空内容")
+
+        result = _parse_vlm_response_json(response, raise_on_error)
+        if result is None:
             return None
-        
-        print(f"[VLM] API 响应 ({elapsed:.2f}s): {text_content[:200]}...")
-        
-        # 解析坐标
-        coords = parse_coordinates(text_content)
-        return coords
-        
+
+        text_content = adapter.parse_response(result)
+        if not text_content:
+            print("[VLM] API returned empty content")
+            return None
+
+        print(f"[VLM] API response ({elapsed:.2f}s): {text_content[:200]}...")
+        return parse_coordinates(text_content)
+
     except requests.Timeout as e:
-        err_msg = f"[VLM] FAIL 请求超时 ({timeout}s)"
+        err_msg = f"[VLM] FAIL request timed out ({timeout}s)"
         print(err_msg)
         if raise_on_error: raise RuntimeError(err_msg) from e
         return None
-    except Exception as e:
-        err_msg = f"[VLM] FAIL 请求失败: {e}"
+    except requests.RequestException as e:
+        err_msg = f"[VLM] FAIL request failed: {e}"
+        print(err_msg)
+        if raise_on_error: raise RuntimeError(err_msg) from e
+        return None
+    except (KeyError, TypeError, IndexError) as e:
+        err_msg = f"[VLM] FAIL malformed API response: {e}"
         print(err_msg)
         if raise_on_error: raise RuntimeError(err_msg) from e
         return None
@@ -825,4 +621,4 @@ def test_vlm():
         print("[VLM] 未找到坐标")
 
 
-vlm_engine_version = "1.1.1"
+vlm_engine_version = "1.1.2"

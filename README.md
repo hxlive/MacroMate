@@ -1,4 +1,4 @@
-# MacroAssistant - 宏助手
+# 智点助手 MacroMate
 
 ![Python Version](https://img.shields.io/badge/python-3.8--3.12-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -7,14 +7,14 @@
 
 ## 📖 项目简介
 
-**宏助手 (MacroAssistant)** 是一款开源免费的 Windows 桌面自动化工具，专为简化重复性任务而设计。无论是办公流程优化、桌面软件批处理、UI 测试，还是个人日常操作自动化，都可以通过图像识别、OCR 文字识别、键鼠模拟和流程控制，把原本需要反复手动点击、输入、判断的步骤整理成可复用的宏。
+**智点助手 (MacroMate)** 是一款开源免费的 Windows 桌面自动化工具，专为简化重复性任务而设计。无论是办公流程优化、桌面软件批处理、UI 测试，还是个人日常操作自动化，都可以通过图像识别、OCR 文字识别、键鼠模拟和流程控制，把原本需要反复手动点击、输入、判断的步骤整理成可复用的宏。
 
 无需编程经验，通过直观的 GUI 界面即可创建自动化流程；需要更复杂逻辑时，也可以使用变量、文件读写、JSON 提取、条件跳转和逐行批量处理，把宏组合成更完整的数据流。
 
 项目在响应速度、运行安全和多屏兼容上做了多轮优化，支持即时热键中断、悬浮状态栏、增强匹配模式、后台 OCR 预加载，以及负坐标/副屏场景下的截图识别。
 
 <p align="center">
-  <img src="screenshot.png" alt="MacroAssistant 截图" width="850">
+  <img src="screenshot.png" alt="MacroMate 截图" width="850">
 </p>
 
 ---
@@ -45,7 +45,7 @@ pip install -r requirements.txt
 2. 启动程序：
 
 ```powershell
-python MacroAssistant.py
+python MacroMate.py
 ```
 
 3. 添加步骤：
@@ -250,7 +250,7 @@ python MacroAssistant.py
 
 ### 6. 人工输入
 
-`人工输入` 不是识别其他软件或网页弹窗。它的作用是：宏执行到这里时，由宏助手自己弹出输入框，等待用户输入内容，再保存到变量。
+`人工输入` 不是识别其他软件或网页弹窗。它的作用是：宏执行到这里时，由智点助手自己弹出输入框，等待用户输入内容，再保存到变量。
 
 适合场景：
 
@@ -399,6 +399,15 @@ OCR 识别结果可以：
 - 关闭 GUI 时会触发停止与进程清理，避免后台残留。
 - 不需要外部脚本时，优先使用内置的 `读取文件到变量`、`写入文件`、`变量计算` 等步骤。
 
+
+1.8.0 安全规则：
+
+- CMD 模式需要 `--enable-run` 后才执行 RUN。
+- `shell_mode` 默认拒绝；不要让宏文件静默开启 Shell。
+- `RUN script` 只允许白名单解释器：`python`、`python3`、`node`、`powershell`、`cmd`、`bat`。
+- `READ_FILE`、`WRITE_FILE`、`RUN file`、`RUN script`、`FOREACH_LINE` 只允许访问宏目录、工作区目录或程序目录。
+- 路径穿越或不安全绝对路径会直接报错，不会越界读写或执行。
+
 ---
 
 ## 🖥️ 多屏与截图
@@ -427,9 +436,17 @@ OCR 识别结果可以：
 开发回归测试命令（当前回归测试文件位于 `Beta` 目录）：
 
 ```powershell
-python -m py_compile core_engine.py gui_utils.py MacroAssistant.py ocr_engine.py vlm_engine.py sys_utils.py
+python -m py_compile core_engine.py gui_utils.py MacroMate.py ocr_engine.py vlm_engine.py sys_utils.py
 python -m unittest discover -s Beta -p "test*.py" -v
 ```
+
+---
+
+## VLM / API Key 说明
+
+- VLM 日志不再打印原始响应或 HTTP 错误全文。
+- API Key 仍保存在本地 `macro_settings.json`，请不要分享该文件。
+- Keyring / Windows 凭据管理器集成已列入后续安全加固计划。
 
 ---
 

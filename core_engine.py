@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
 # 描述:自动化宏的核心功能引擎
-# 版本:1.7.3
-# # 变更:(修复) 新增 MacroStopException，实现快捷键即时中断
+# 版本:1.8.0
+CORE_VERSION = "1.8.0"
 
 # ======================================================================
 # 即时中断异常
@@ -34,6 +34,7 @@ import shlex
 import ctypes
 import functools
 import threading
+import tempfile
 import ast
 import math
 import operator as operator_module
@@ -46,7 +47,7 @@ if sys.platform == 'win32':
     ctypes.windll.kernel32.LocalFree.restype = ctypes.c_void_p
 
 # ======================================================================
-# 7. 宏文件持久化工具 (从 MacroAssistant.py 迁移)
+# 7. 宏文件持久化工具 (从 MacroMate.py 迁移)
 # ======================================================================
 class MacroPersistence:
     @staticmethod
@@ -111,6 +112,7 @@ CACHE_BOX_PADDING = 50  # 缓存区域扩展边距（像素）
 TEMPLATE_CACHE_SIZE = 200  # 模板缓存大小，限制大图/多缩放场景的内存占用
 QUICK_CHECK_SCALES = (1.0, 0.9, 1.1)  # 快速检查尝试的缩放比例
 GOTO_LABEL_DEFAULT_MAX_JUMPS = 100
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 try:
@@ -262,42 +264,50 @@ perf = PerformanceMonitor()
 # 循环缓存管理器
 # ======================================================================
 class LoopCacheManager:
-    def __init__(self): self.reset()
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.reset()
     
     def reset(self):
-        self.caches = {}
-        self.stack = []
+        with self._lock:
+            self.caches = {}
+            self.stack = []
         
     def get_current_loop_id(self):
-        return self.stack[-1] if self.stack else None
+        with self._lock:
+            return self.stack[-1] if self.stack else None
 
     def enter(self, loop_id):
-        if loop_id not in self.caches:
-            self.caches[loop_id] = {}
-        self.stack.append(loop_id)
+        with self._lock:
+            if loop_id not in self.caches:
+                self.caches[loop_id] = {}
+            self.stack.append(loop_id)
 
     def exit(self):
-        if self.stack:
-            loop_id = self.stack.pop()
-            # 主动清理该循环的缓存，符合设计原则
-            # 注意: execute_steps 的 finally 块也会调用 reset() 作为兜底
+        with self._lock:
+            if self.stack:
+                loop_id = self.stack.pop()
+                # Clear this loop cache here; execute_steps finally also resets as a fallback.
+                if loop_id in self.caches:
+                    del self.caches[loop_id]
+
+    def clear_cache(self, loop_id):
+        with self._lock:
             if loop_id in self.caches:
                 del self.caches[loop_id]
 
-    def clear_cache(self, loop_id):
-        if loop_id in self.caches:
-            del self.caches[loop_id]
-
     def get(self, sig): 
-        loop_id = self.get_current_loop_id()
-        return self.caches.get(loop_id, {}).get(sig) if loop_id else None
+        with self._lock:
+            loop_id = self.stack[-1] if self.stack else None
+            return self.caches.get(loop_id, {}).get(sig) if loop_id else None
 
     def set(self, sig, loc): 
-        loop_id = self.get_current_loop_id()
-        if loop_id:
-            if loop_id not in self.caches:
-                 self.caches[loop_id] = {}
-            self.caches[loop_id][sig] = loc
+        with self._lock:
+            loop_id = self.stack[-1] if self.stack else None
+            if loop_id:
+                if loop_id not in self.caches:
+                     self.caches[loop_id] = {}
+                self.caches[loop_id][sig] = loc
 
 loop_cache = LoopCacheManager()
 
@@ -453,7 +463,7 @@ def _get_template(path, scale):
         img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
     return img, img.shape[1], img.shape[0]
 
-def find_image_cv2(path, conf, screenshot_pil, offset=(0,0), enhanced_mode=False):
+def find_image_cv2(path, conf, screenshot_pil, offset=(0,0), enhanced_mode=False, ctx=None):
     if not OPENCV_AVAILABLE: return None
     try:
         t0 = time.time()
@@ -461,6 +471,7 @@ def find_image_cv2(path, conf, screenshot_pil, offset=(0,0), enhanced_mode=False
         best = (-1, None, 0, 0)
         scales_to_try = SCALES if enhanced_mode else [1.0]
         for scale in scales_to_try:
+            _raise_if_stop_requested(ctx, "Stop requested during image matching")
             tmpl, tw, th = _get_template(path, scale)
             if tmpl is None or th > screen_gray.shape[0] or tw > screen_gray.shape[1]: continue
             res = cv2.matchTemplate(screen_gray, tmpl, cv2.TM_CCOEFF_NORMED)
@@ -557,6 +568,57 @@ def _build_goto_label_table(steps):
             loop_depth += 1
     return labels
 
+def _normalize_path_for_compare(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+def _is_path_inside(path, root):
+    try:
+        return os.path.commonpath([
+            _normalize_path_for_compare(path),
+            _normalize_path_for_compare(root),
+        ]) == _normalize_path_for_compare(root)
+    except (ValueError, OSError):
+        return False
+
+def _get_allowed_file_roots(ctx):
+    roots = [APP_DIR, os.getcwd(), tempfile.gettempdir()]
+    base_dir = ctx.get('macro_base_dir') if ctx else None
+    if base_dir:
+        roots.append(base_dir)
+    for root in (ctx or {}).get('allowed_file_roots', []) or []:
+        if root:
+            roots.append(root)
+
+    normalized = []
+    for root in roots:
+        try:
+            normalized_root = _normalize_path_for_compare(root)
+            if normalized_root not in normalized:
+                normalized.append(normalized_root)
+        except (TypeError, ValueError, OSError):
+            continue
+    return normalized
+
+def _resolve_safe_file_path(file_path, ctx, purpose='file access'):
+    file_path = str(file_path or '').strip()
+    if not file_path:
+        raise ValueError('路径为空')
+
+    base_dir = (ctx or {}).get('macro_base_dir') or os.getcwd()
+    expanded = os.path.expandvars(os.path.expanduser(file_path))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(base_dir, expanded)
+    resolved = _normalize_path_for_compare(expanded)
+
+    if (ctx or {}).get('allow_external_paths', False):
+        return resolved
+
+    for root in _get_allowed_file_roots(ctx or {}):
+        if _is_path_inside(resolved, root):
+            return resolved
+
+    raise PermissionError(f"{purpose} 路径不在允许目录内: {file_path}")
+
 def _render_vars(param_str, ctx):
     if not isinstance(param_str, str) or not param_str: return param_str
     vars_dict = ctx.get('vars', {})
@@ -564,6 +626,28 @@ def _render_vars(param_str, ctx):
         var_name = match.group(1)
         return str(vars_dict.get(var_name, match.group(0)))
     return re.sub(r'\{([^{}]+)\}', repl, param_str)
+
+
+def _call_vlm_with_stop(instruction, region, ctx):
+    done = threading.Event()
+    result = {'coords': None, 'error': None}
+
+    def worker():
+        try:
+            result['coords'] = vlm_engine.find_location_by_vlm(instruction, region=region)
+        except Exception as e:
+            result['error'] = e
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    while not done.wait(0.1):
+        if ctx.get('stop_requested'):
+            raise MacroStopException("Stop requested while VLM request is active")
+    if result['error'] is not None:
+        raise result['error']
+    return result['coords']
 
 def _parse_json_path(path):
     path = str(path or '').strip()
@@ -699,10 +783,16 @@ def _compare_values(left, operator, right):
     if operator not in numeric_ops:
         return False
 
+    if operator in ('==', '!='):
+        try:
+            return numeric_ops[operator](_parse_compare_number(left), _parse_compare_number(right))
+        except (TypeError, ValueError, InvalidOperation):
+            return numeric_ops[operator](left, right)
+
     try:
         return numeric_ops[operator](_parse_compare_number(left), _parse_compare_number(right))
     except (TypeError, ValueError, InvalidOperation):
-        return numeric_ops[operator](left, right)
+        return False
 
 def _parse_compare_number(value):
     text = str(value).strip()
@@ -740,6 +830,10 @@ def _validate_calc_number(value):
         raise OverflowError("Calculation result is too large")
     return value
 
+def _raise_if_stop_requested(ctx, message="Stop requested"):
+    if ctx and ctx.get('stop_requested'):
+        raise MacroStopException(message)
+
 def _safe_calculate_expression(expression):
     def eval_node(node):
         if isinstance(node, ast.Expression):
@@ -760,8 +854,173 @@ def _safe_calculate_expression(expression):
 
     return eval_node(ast.parse(str(expression), mode='eval'))
 
+_ACTION_DONE = "done"
+_ACTION_SKIP = "skip"
+_ACTION_BREAK = "break"
+
+
+def _handle_click_action(p, ctx):
+    btn = p.get('button', 'left').lower()
+    clicks, ok = _safe_int(p.get('clicks', 1), None, min_value=1)
+    if not ok:
+        _error_param_skip('CLICK', 'clicks', 'positive integer')
+        return _ACTION_SKIP
+    interval, ok = _safe_float(p.get('interval', 0.0), 0.0, min_value=0)
+    if not ok:
+        _warn_param_default('CLICK', 'interval', interval)
+    duration, ok = _safe_float(p.get('duration', 0.0), 0.0, min_value=0)
+    if not ok:
+        _warn_param_default('CLICK', 'duration', duration)
+    try:
+        x = int(p.get('x', '')) if str(p.get('x', '')).strip() else None
+        y = int(p.get('y', '')) if str(p.get('y', '')).strip() else None
+    except (ValueError, TypeError):
+        print("  [ERROR] CLICK invalid coordinates")
+        return _ACTION_BREAK
+    pyautogui.click(x=x, y=y, button=btn, clicks=clicks, interval=interval, duration=duration)
+    if x is not None and y is not None:
+        ctx['last_pos'] = (x, y)
+    return _ACTION_DONE
+
+
+def _handle_move_to_action(p, ctx):
+    try:
+        x, y = int(p.get('x', 0)), int(p.get('y', 0))
+    except (ValueError, TypeError):
+        print("  [ERROR] MOVE_TO invalid coordinates")
+        return _ACTION_BREAK
+    duration, ok = _safe_float(p.get('duration', 0.25), 0.25, min_value=0)
+    if not ok:
+        _warn_param_default('MOVE_TO', 'duration', duration)
+    pyautogui.moveTo(x, y, duration=duration)
+    ctx['last_pos'] = (x, y)
+    return _ACTION_DONE
+
+
+def _handle_move_offset_action(p, ctx):
+    if ctx['last_pos'][0] is None or ctx['last_pos'][1] is None:
+        print("  [ERROR] MOVE_OFFSET has no last position")
+        return _ACTION_BREAK
+    try:
+        ox, oy = int(p.get('x_offset', 0)), int(p.get('y_offset', 0))
+    except (ValueError, TypeError):
+        print("  [ERROR] MOVE_OFFSET invalid offset")
+        return _ACTION_BREAK
+    duration, ok = _safe_float(p.get('duration', 0.25), 0.25, min_value=0)
+    if not ok:
+        _warn_param_default('MOVE_OFFSET', 'duration', duration)
+    pyautogui.move(ox, oy, duration=duration)
+    ctx['last_pos'] = (ctx['last_pos'][0] + ox, ctx['last_pos'][1] + oy)
+    return _ACTION_DONE
+
+
+def _handle_scroll_action(p, ctx):
+    try:
+        clicks = int(p.get('amount', 0))
+    except (ValueError, TypeError):
+        print("  [ERROR] SCROLL invalid amount")
+        return _ACTION_BREAK
+    try:
+        if 'x' in p and 'y' in p and str(p.get('x', '')).strip() and str(p.get('y', '')).strip():
+            pyautogui.moveTo(int(p['x']), int(p['y']))
+    except (ValueError, TypeError):
+        print("  [ERROR] SCROLL invalid coordinates")
+        return _ACTION_BREAK
+    pyautogui.scroll(clicks)
+    return _ACTION_DONE
+
+
+def _handle_wait_action(p, ctx):
+    try:
+        total_ms = int(p.get('ms', 0))
+    except (ValueError, TypeError):
+        print("  [ERROR] WAIT ms must be an integer; step skipped")
+        return _ACTION_SKIP
+    if total_ms <= 0:
+        print("  [WARN] WAIT has no positive duration; step skipped")
+        return _ACTION_SKIP
+    interrupted = False
+    for elapsed_ms in range(0, total_ms, 100):
+        if ctx.get('stop_requested'):
+            interrupted = True
+            break
+        time.sleep(min(100, total_ms - elapsed_ms) / 1000.0)
+    if interrupted:
+        raise MacroStopException("Stop requested during WAIT")
+    return _ACTION_DONE
+
+
+def _handle_type_text_action(p, ctx):
+    interval, ok = _safe_float(p.get('interval', 0.0), 0.0, min_value=0)
+    if not ok:
+        _warn_param_default('TYPE_TEXT', 'interval', interval)
+    text = _render_vars(p.get('text', ''), ctx)
+    if not text:
+        print("  [WARN] TYPE_TEXT has no text; step skipped")
+        return _ACTION_SKIP
+
+    if '{CLIPBOARD}' in text:
+        clipboard_content = ctx.get('clipboard_var', '')
+        if not clipboard_content:
+            try:
+                clipboard_content = pyperclip.paste()
+            except Exception:
+                clipboard_content = ''
+        text = text.replace('{CLIPBOARD}', clipboard_content)
+        print(f"  [TYPE_TEXT] replaced clipboard placeholder: {text}")
+
+    if interval > 0:
+        pyautogui.write(text, interval=interval)
+    else:
+        copy_success = _copy_to_clipboard_with_retry(text, ctx)
+        if copy_success:
+            time.sleep(0.1)
+            pyautogui.hotkey('ctrl', 'v')
+        else:
+            print("  [ERROR] clipboard copy failed; paste skipped")
+    return _ACTION_DONE
+
+
+def _handle_press_key_action(p, ctx):
+    keys = [k for k in p.get('key', '').lower().replace(' ', '').split('+') if k]
+    if keys:
+        pyautogui.hotkey(*keys)
+    return _ACTION_DONE
+
+
+def _handle_note_action(p, ctx):
+    note_text = p.get('text', '')
+    if note_text:
+        print(f"  [NOTE] {note_text}")
+    return _ACTION_SKIP
+
+
+def _handle_set_var_action(p, ctx):
+    var_name = p.get('var_name', '').strip()
+    var_value = _render_vars(str(p.get('var_value', '')), ctx)
+    if var_name:
+        ctx['vars'][var_name] = var_value
+        print(f"  [VAR] {var_name} = '{var_value}'")
+    return _ACTION_DONE
+
+
+def _handle_calculate_action(p, ctx):
+    expr = _render_vars(str(p.get('expression', '')), ctx)
+    var_name = p.get('var_name', '').strip()
+    if not expr or not var_name:
+        print("  [ERROR] CALCULATE missing expression or var_name")
+        return _ACTION_BREAK
+    try:
+        val = _safe_calculate_expression(expr)
+        ctx['vars'][var_name] = str(val)
+        print(f"  [VAR] {var_name} = {val} (calculated)")
+    except (ValueError, TypeError, OverflowError, SyntaxError, ZeroDivisionError) as e:
+        print(f"  [ERROR] CALCULATE failed '{expr}': {e}")
+        return _ACTION_SKIP
+    return _ACTION_DONE
+
 def execute_steps(steps, run_context=None, status_callback=None):
-    print(f"\n--- 执行开始 (Core V1.7.1 Beta) ---")
+    print(f"\n--- 执行开始 (Core V{CORE_VERSION}) ---")
     perf.reset(); loop_cache.reset()
     _get_template.cache_clear()
     ctx = run_context if run_context else {}
@@ -780,7 +1039,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
     
     default_stop = "Ctrl+F11"
     try:
-        s = run_context.get('stop_key_str', default_stop)
+        s = ctx.get('stop_key_str', default_stop)
         stop_key_display = HotkeyUtils.format_hotkey_display(s)
     except Exception:
         stop_key_display = default_stop
@@ -816,7 +1075,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     if act.startswith('IF_'):
                         if not res:
                             print("  -> IF条件不满足,跳过")
-                            next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['ELSE', 'END_IF'])
+                            next_pc = _find_jump_or_raise(steps, pc, 'IF_', 'END_IF', ['ELSE', 'END_IF'])
                     elif not res: print("  -> 没找到目标,宏停止"); break
                     
                     # FIND_ 和 IF_ 找到目标后均移动鼠标，保持 2026-05-16 的稳定行为。
@@ -848,7 +1107,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     print(f"  [AI] 执行指令: {instruction}")
                     
                     # 调用 VLM 引擎
-                    coords = vlm_engine.find_location_by_vlm(instruction, region=region)
+                    coords = _call_vlm_with_stop(instruction, region, ctx)
                     
                     if coords:
                         target_x, target_y = coords
@@ -864,121 +1123,34 @@ def execute_steps(steps, run_context=None, status_callback=None):
                             break
                 
                 elif act == 'CLICK':
-                    btn = p.get('button', 'left').lower()
-                    clicks, ok = _safe_int(p.get('clicks', 1), None, min_value=1)
-                    if not ok:
-                        _error_param_skip('CLICK', 'clicks', 'positive integer')
+                    action_result = _handle_click_action(p, ctx)
+                    if action_result == _ACTION_SKIP:
                         pc = next_pc; continue
-                    interval, ok = _safe_float(p.get('interval', 0.0), 0.0, min_value=0)
-                    if not ok:
-                        _warn_param_default('CLICK', 'interval', interval)
-                    duration, ok = _safe_float(p.get('duration', 0.0), 0.0, min_value=0)
-                    if not ok:
-                        _warn_param_default('CLICK', 'duration', duration)
-                    try:
-                        x = int(p.get('x', '')) if str(p.get('x', '')).strip() else None
-                        y = int(p.get('y', '')) if str(p.get('y', '')).strip() else None
-                    except (ValueError, TypeError):
-                        print("  [错误] CLICK 坐标参数无效")
+                    if action_result == _ACTION_BREAK:
                         break
-                    pyautogui.click(x=x, y=y, button=btn, clicks=clicks, interval=interval, duration=duration)
-                    if x is not None and y is not None:
-                        ctx['last_pos'] = (x, y)
                 
                 elif act == 'MOVE_TO':
-                    try:
-                        x, y = int(p.get('x', 0)), int(p.get('y', 0))
-                    except (ValueError, TypeError):
-                        print("  [错误] MOVE_TO 坐标参数无效")
+                    if _handle_move_to_action(p, ctx) == _ACTION_BREAK:
                         break
-                    duration, ok = _safe_float(p.get('duration', 0.25), 0.25, min_value=0)
-                    if not ok:
-                        _warn_param_default('MOVE_TO', 'duration', duration)
-                    pyautogui.moveTo(x, y, duration=duration)
-                    ctx['last_pos'] = (x, y)
                 
                 elif act == 'MOVE_OFFSET':
-                    if ctx['last_pos'][0] is None or ctx['last_pos'][1] is None:
-                        print("  [错误] 无上次坐标"); break
-                    try:
-                        ox, oy = int(p.get('x_offset', 0)), int(p.get('y_offset', 0))
-                    except (ValueError, TypeError):
-                        print("  [错误] MOVE_OFFSET 偏移参数无效")
+                    if _handle_move_offset_action(p, ctx) == _ACTION_BREAK:
                         break
-                    duration, ok = _safe_float(p.get('duration', 0.25), 0.25, min_value=0)
-                    if not ok:
-                        _warn_param_default('MOVE_OFFSET', 'duration', duration)
-                    pyautogui.move(ox, oy, duration=duration)
-                    ctx['last_pos'] = (ctx['last_pos'][0]+ox, ctx['last_pos'][1]+oy)
                 
                 elif act == 'SCROLL':
-                    try:
-                        clicks = int(p.get('amount', 0))
-                    except (ValueError, TypeError):
-                        print("  [错误] SCROLL amount 参数无效")
+                    if _handle_scroll_action(p, ctx) == _ACTION_BREAK:
                         break
-                    try:
-                        if 'x' in p and 'y' in p and str(p.get('x', '')).strip() and str(p.get('y', '')).strip():
-                            pyautogui.moveTo(int(p['x']), int(p['y']))
-                    except (ValueError, TypeError):
-                        print("  [错误] SCROLL 坐标参数无效")
-                        break
-                    pyautogui.scroll(clicks) 
                 
                 elif act == 'WAIT':
-                    # [P2防御] 防止 JSON 中 ms 为非数字字符串触发 traceback
-                    try:
-                        total_ms = int(p.get('ms', 0))
-                    except (ValueError, TypeError):
-                        print("  [错误] WAIT 参数 'ms' 必须是整数，步骤已跳过")
+                    if _handle_wait_action(p, ctx) == _ACTION_SKIP:
                         pc = next_pc; continue
-                    if total_ms <= 0:
-                        print("  [警告] WAIT 未指定有效等待时间，跳过")
-                        pc = next_pc; continue
-                    interrupted = False
-                    for _ in range(0, total_ms, 100):
-                        if ctx.get('stop_requested'):
-                            interrupted = True
-                            break
-                        time.sleep(min(100, total_ms - _) / 1000.0)
-                    if interrupted:
-                        raise MacroStopException("用户在等待期间请求停止")
                 
                 elif act == 'TYPE_TEXT':
-                    interval, ok = _safe_float(p.get('interval', 0.0), 0.0, min_value=0)
-                    if not ok:
-                        _warn_param_default('TYPE_TEXT', 'interval', interval)
-                    text = p.get('text', '')
-                    text = _render_vars(text, ctx)
-                    
-                    if not text:
-                        print("  [警告] TYPE_TEXT 未指定输入文本，跳过")
+                    if _handle_type_text_action(p, ctx) == _ACTION_SKIP:
                         pc = next_pc; continue
-                    
-                    if '{CLIPBOARD}' in text:
-                        clipboard_content = ctx.get('clipboard_var', '')
-                        if not clipboard_content:
-                            try:
-                                clipboard_content = pyperclip.paste()
-                            except Exception:
-                                clipboard_content = ''
-                        
-                        text = text.replace('{CLIPBOARD}', clipboard_content)
-                        print(f"  [输入] 替换占位符: {text}")
-                    
-                    if interval > 0: pyautogui.write(text, interval=interval)
-                    else:
-                        copy_success = _copy_to_clipboard_with_retry(text, ctx)
-                        
-                        if copy_success:
-                            time.sleep(0.1)
-                            pyautogui.hotkey('ctrl', 'v')
-                        else:
-                            print("  [错误] 剪贴板复制失败，跳过粘贴")
                 
                 elif act == 'PRESS_KEY':
-                    keys = [k for k in p.get('key', '').lower().replace(' ', '').split('+') if k]
-                    if keys: pyautogui.hotkey(*keys)
+                    _handle_press_key_action(p, ctx)
                 
                 elif act == 'ACTIVATE_WINDOW':
                     if not PYGETWINDOW_AVAILABLE:
@@ -1010,30 +1182,23 @@ def execute_steps(steps, run_context=None, status_callback=None):
                                 raise MacroStopException("用户在窗口激活期间请求停止")
                             time.sleep(0.1) 
                     except Exception as e:
-                        if p.get('ignore_fail', False):
+                        msg = str(e)
+                        if p.get('ignore_fail', False) and not msg.startswith("No window title contains"):
                             print(f"  [WARN] ACTIVATE_WINDOW failed and was ignored: {e}")
                             pc = next_pc; continue
                         raise RuntimeError(f"ACTIVATE_WINDOW failed: {e}") from e
                 
                 elif act == 'NOTE':
-                    # 备注动作 - 仅打印注释，不执行任何操作
-                    note_text = p.get('text', '')
-                    if note_text:
-                        print(f"  [备注] {note_text}")
-                    # 注意：必须更新 pc，否则会无限循环
+                    _handle_note_action(p, ctx)
                     pc = next_pc
                     continue
 
                 elif act == 'SET_VAR':
-                    var_name = p.get('var_name', '').strip()
-                    var_value = _render_vars(str(p.get('var_value', '')), ctx)
-                    if var_name:
-                        ctx['vars'][var_name] = var_value
-                        print(f"  [变量] {var_name} = '{var_value}'")
+                    _handle_set_var_action(p, ctx)
 
                 elif act == 'PROMPT_INPUT':
                     var_name = p.get('var_name', '').strip()
-                    title = _render_vars(str(p.get('title', '宏助手输入')), ctx)
+                    title = _render_vars(str(p.get('title', '智点助手输入')), ctx)
                     prompt = _render_vars(str(p.get('prompt', '请输入内容:')), ctx)
                     default_value = _render_vars(str(p.get('default_value', '')), ctx)
                     if not var_name:
@@ -1064,10 +1229,12 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         print("  [错误] READ_FILE 参数不完整")
                         break
                     try:
-                        with open(file_path, 'r', encoding=encoding) as f:
+                        safe_path = _resolve_safe_file_path(file_path, ctx, 'READ_FILE')
+                        with open(safe_path, 'r', encoding=encoding) as f:
                             ctx['vars'][var_name] = f.read()
                         print(f"  [变量] {var_name} 已读取文件 ({len(ctx['vars'][var_name])} 字符)")
                     except Exception as e:
+                        ctx['vars'][var_name] = ""
                         print(f"  [错误] READ_FILE 读取失败: {e}")
                         if p.get('fail_stop', False): break
                         
@@ -1087,6 +1254,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         ctx['vars'][var_name] = val
                         print(f"  [变量] {var_name} 提取为 '{val}'")
                     except Exception as e:
+                        ctx['vars'][var_name] = ""
                         print(f"  [错误] EXTRACT_VAR 提取失败: {e}")
                         if p.get('fail_stop', False): break
 
@@ -1125,24 +1293,14 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         
                     if not res_bool:
                         print(f"  -> IF条件不满足: '{var_val}' {op} '{expected}'")
-                        next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['ELSE', 'END_IF'])
+                        next_pc = _find_jump_or_raise(steps, pc, 'IF_', 'END_IF', ['ELSE', 'END_IF'])
                     else:
                         print(f"  -> IF条件满足: '{var_val}' {op} '{expected}'")
 
                 elif act == 'CALCULATE':
-                    expr = _render_vars(str(p.get('expression', '')), ctx)
-                    var_name = p.get('var_name', '').strip()
-                    if not expr or not var_name:
-                        print("  [错误] CALCULATE 参数不完整")
-                        break
-                    try:
-                        val = _safe_calculate_expression(expr)
-                        ctx['vars'][var_name] = str(val)
-                        print(f"  [变量] {var_name} = {val} (计算结果)")
-                    except Exception as e:
-                        print(f"  [错误] CALCULATE 计算失败 '{expr}': {e}")
-                        if p.get('fail_stop', False): break
-                        
+                    if _handle_calculate_action(p, ctx) == _ACTION_SKIP:
+                        pc = next_pc; continue
+                
                 elif act == 'WRITE_FILE':
                     file_path = _render_vars(str(p.get('file_path', '')), ctx)
                     content = _render_vars(str(p.get('content', '')), ctx)
@@ -1153,11 +1311,12 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         break
                     try:
                         mode = 'a' if append else 'w'
-                        dir_path = os.path.dirname(file_path)
+                        safe_path = _resolve_safe_file_path(file_path, ctx, 'WRITE_FILE')
+                        dir_path = os.path.dirname(safe_path)
                         if dir_path and not os.path.exists(dir_path): os.makedirs(dir_path, exist_ok=True)
-                        with open(file_path, mode, encoding=encoding) as f:
+                        with open(safe_path, mode, encoding=encoding) as f:
                             f.write(content)
-                        print(f"  [写入] {file_path} (追加: {append})")
+                        print(f"  [写入] {safe_path} (追加: {append})")
                     except Exception as e:
                         print(f"  [错误] WRITE_FILE 失败: {e}")
                         if p.get('fail_stop', False): break
@@ -1228,7 +1387,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
                         print(f"  [RUN] 执行成功")
 
                 elif act == 'ELSE': 
-                    next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['END_IF'])
+                    next_pc = _find_jump_or_raise(steps, pc, 'IF_', 'END_IF', ['END_IF'])
                 
                 elif act == 'LOOP_START':
                     next_pc = _handle_loop_start(steps, pc, loops, p, ctx, status_callback)
@@ -1299,6 +1458,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
                 raise MacroStopException("PyAutoGUI failsafe triggered") from e
             except MacroStopException:
                 raise  # 向上传播，不要吞掉
+            except LoopConditionCheckError:
+                raise
             except Exception as e:
                 error_msg = f"  [执行异常] 步骤 {pc+1} ({act}): {e}"
                 print(error_msg)
@@ -1314,6 +1475,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
         print(f"--- 执行结束 ---\n[统计] {perf.get_stats()}\n")
 
 def _handle_find(act, p, ctx, in_loop):
+    _raise_if_stop_requested(ctx, "Stop requested before find")
     is_img = 'IMAGE' in act
     final_engine = FORCE_OCR_ENGINE if (FORCE_OCR_ENGINE and FORCE_OCR_ENGINE != 'auto') else p.get('engine', 'auto')
     sig = f"{act}_{p.get('path', p.get('text',''))}"
@@ -1334,6 +1496,7 @@ def _handle_find(act, p, ctx, in_loop):
     ss = None
     try:
         ss, offset = smart_screenshot(region)
+        _raise_if_stop_requested(ctx, "Stop requested after screenshot")
 
         # 增强模式：IF 动作和多缩放尝试（性能开销大，但更准确）
         enhanced_mode = ctx.get('enhanced_mode', False)
@@ -1348,6 +1511,7 @@ def _handle_find(act, p, ctx, in_loop):
                     perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
 
         res = _do_find(is_img, p, ss, offset, final_engine, ctx)
+        _raise_if_stop_requested(ctx, "Stop requested after find")
 
         # IF 动作不使用全局 fallback（会大幅降低性能，因为它已经重复搜索了）
         # FIND_TEXT/FIND_IMAGE 才使用 fallback
@@ -1359,7 +1523,9 @@ def _handle_find(act, p, ctx, in_loop):
                 except Exception: pass
                 ss = None
             ss, offset = smart_screenshot(None)
+            _raise_if_stop_requested(ctx, "Stop requested after fallback screenshot")
             res = _do_find(is_img, p, ss, offset, final_engine, ctx)
+            _raise_if_stop_requested(ctx, "Stop requested after fallback find")
             if res:
                 if len(res) >= 2:
                     runtime_cache_boxes[sig] = [res[0]-20, res[1]-10, res[0]+20, res[1]+10]
@@ -1390,7 +1556,7 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
         confidence, ok = _safe_float(p.get('confidence', 0.8), 0.8, min_value=0, max_value=1)
         if not ok:
             _warn_param_default('FIND_IMAGE', 'confidence', confidence)
-        res_val = find_image_cv2(p.get('path',''), confidence, ss, offset, enhanced_mode)
+        res_val = find_image_cv2(p.get('path',''), confidence, ss, offset, enhanced_mode, ctx)
         if res_val:
             perf.record_hit(False, False)
             print(f"  [找到] 图 ({res_val[0][0]},{res_val[0][1]})")
@@ -1471,7 +1637,7 @@ def _handle_foreach_line_start(steps, pc, loops, p, ctx, cb):
             if cb:
                 cb("批量处理完成")
             print("  [批量] 所有行已处理完成")
-            return _find_jump(steps, pc, 'FOREACH_LINE', 'END_FOREACH', ['END_FOREACH'])
+            return _find_jump_or_raise(steps, pc, 'FOREACH_LINE', 'END_FOREACH', ['END_FOREACH'])
 
         top['index'] = next_index
         _set_foreach_line_vars(top, ctx)
@@ -1486,29 +1652,37 @@ def _handle_foreach_line_start(steps, pc, loops, p, ctx, cb):
     file_path = _render_vars(str(p.get('file_path', '')), ctx).strip()
     source_text = _render_vars(str(p.get('source_text', '')), ctx)
     encoding = p.get('encoding', 'utf-8')
-
-    if file_path:
-        with open(file_path, 'r', encoding=encoding) as f:
-            source_text = f.read()
-
-    if source_text is None or source_text == '':
-        print("  [批量] 数据为空，跳过批量处理块")
-        return _find_jump(steps, pc, 'FOREACH_LINE', 'END_FOREACH', ['END_FOREACH'])
-
-    skip_empty = _parse_bool_param(p.get('skip_empty', True), True)
-    lines = source_text.splitlines()
-    if skip_empty:
-        lines = [line for line in lines if line.strip()]
-
     max_lines, ok = _safe_int(p.get('max_lines', 10000), 10000, min_value=1)
     if not ok:
         _warn_param_default('FOREACH_LINE', 'max_lines', max_lines)
-    if len(lines) > max_lines:
-        raise RuntimeError(f"批量处理行数 {len(lines)} 超过安全上限 {max_lines}")
+    skip_empty = _parse_bool_param(p.get('skip_empty', True), True)
+
+    if file_path:
+        safe_path = _resolve_safe_file_path(file_path, ctx, 'FOREACH_LINE')
+        lines = []
+        with open(safe_path, 'r', encoding=encoding) as f:
+            for raw_line in f:
+                line = raw_line.rstrip('\r\n')
+                if skip_empty and not line.strip():
+                    continue
+                lines.append(line)
+                if len(lines) > max_lines:
+                    raise RuntimeError(f"FOREACH_LINE exceeds max_lines {max_lines}")
+    else:
+        if source_text is None or source_text == '':
+            print("  [FOREACH_LINE] data is empty, block skipped")
+            return _find_jump_or_raise(steps, pc, 'FOREACH_LINE', 'END_FOREACH', ['END_FOREACH'])
+        lines = source_text.splitlines()
+        if skip_empty:
+            lines = [line for line in lines if line.strip()]
+        if len(lines) > max_lines:
+            raise RuntimeError(f"FOREACH_LINE line count {len(lines)} exceeds max_lines {max_lines}")
 
     if not lines:
         print("  [批量] 没有可处理的行，跳过批量处理块")
-        return _find_jump(steps, pc, 'FOREACH_LINE', 'END_FOREACH', ['END_FOREACH'])
+        return _find_jump_or_raise(steps, pc, 'FOREACH_LINE', 'END_FOREACH', ['END_FOREACH'])
+
+    _find_jump_or_raise(steps, pc, 'FOREACH_LINE', 'END_FOREACH', ['END_FOREACH'])
 
     loop_data = {
         'kind': 'foreach_line',
@@ -1547,7 +1721,7 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
             loop_cache.clear_cache(loop_id_to_exit)
             if cb: cb(f"达到最大迭代 {top['max_iterations']} 次,循环结束")
             print(f"  [Loop] 警告:达到最大迭代次数 {top['max_iterations']}")
-            return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
+            return _find_jump_or_raise(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
         
         # 固定次数循环:检查剩余次数
         if mode == 'fixed':
@@ -1562,7 +1736,7 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
                 loop_id_to_exit = loops.pop()['id']
                 loop_cache.exit()
                 loop_cache.clear_cache(loop_id_to_exit)
-                return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
+                return _find_jump_or_raise(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
         
         # === 关键修复: 条件循环不在此增加计数,交给 END_LOOP ===
         # 条件循环的迭代计数和退出判断统一在 END_LOOP 处理
@@ -1587,9 +1761,9 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
                 count = int(p.get('times', 1))
             except (ValueError, TypeError):
                 print("  [错误] LOOP_START 参数 'times' 必须是整数，循环已跳过")
-                return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
+                return _find_jump_or_raise(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
             if count <= 0:
-                return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
+                return _find_jump_or_raise(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
             remain = count - 1
         else:
             count = max_iter  # 条件循环用 max_iter 作为参考
@@ -1654,7 +1828,14 @@ def _find_jump(steps, start, open_tag, close_tag, targets):
             if lvl == 0 and a in targets: return i + 1
             lvl -= 1
         elif lvl == 0 and a in targets: return i + 1
-    return len(steps)
+    return -1
+
+def _find_jump_or_raise(steps, start, open_tag, close_tag, targets):
+    target = _find_jump(steps, start, open_tag, close_tag, targets)
+    if target < 0:
+        action = steps[start].get('action', '') if 0 <= start < len(steps) else ''
+        raise RuntimeError(f"Control-flow structure is incomplete: step {start + 1} {action} cannot find {targets}")
+    return target
 
 def _check_loop_condition(loop_data, ctx):
     """检查循环退出条件是否满足
@@ -1686,8 +1867,9 @@ def _check_loop_condition(loop_data, ctx):
         try:
             region = _build_region(loop_data)
             ss, offset = smart_screenshot(region)
+            _raise_if_stop_requested(ctx, "Stop requested after loop screenshot")
             enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
-            res_val = find_image_cv2(path, conf, ss, offset=offset, enhanced_mode=enhanced_mode)
+            res_val = find_image_cv2(path, conf, ss, offset=offset, enhanced_mode=enhanced_mode, ctx=ctx)
             found = res_val is not None
             if found:
                 print(f"  [Loop Until] OK 找到目标图像: {os.path.basename(path)}")
@@ -1715,6 +1897,7 @@ def _check_loop_condition(loop_data, ctx):
         try:
             region = _build_region(loop_data)
             ss, offset = smart_screenshot(region)
+            _raise_if_stop_requested(ctx, "Stop requested after loop screenshot")
             enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
             res = ocr_engine.find_text_location(text, lang, False, ss, offset, 'auto', enhanced_mode)
             
@@ -1738,7 +1921,7 @@ def _check_loop_condition(loop_data, ctx):
     
     return False
 
-core_engine_version = f"1.7.1 Beta (Core) / OpenCV: {OPENCV_AVAILABLE}"
+core_engine_version = f"{CORE_VERSION} (Core) / OpenCV: {OPENCV_AVAILABLE}"
 
 # ======================================================================
 # RUN 处理函数：执行命令/脚本/文件
@@ -1814,9 +1997,9 @@ def cleanup_active_processes(ctx):
     active = ctx.setdefault('_active_processes', set())
     with lock:
         processes = list(active)
+        active.clear()
     for process in processes:
         terminate_process_tree(process)
-        _unregister_active_process(ctx, process)
 
 def _execute_subprocess(cmd_list, shell_mode, cwd, timeout, save_output, ctx, run_mode_name):
     """提取的通用子进程执行与输出处理逻辑"""
@@ -1932,15 +2115,17 @@ def _handle_run(p, ctx):
             encoding = p.get('encoding', 'utf-8')
             
             # 检查目录是否存在
-            dir_path = os.path.dirname(file_path)
+            safe_path = _resolve_safe_file_path(file_path, ctx, 'RUN file')
+            # Ensure the output directory exists
+            dir_path = os.path.dirname(safe_path)
             if dir_path and not os.path.exists(dir_path):
                 os.makedirs(dir_path, exist_ok=True)
-                print(f"  [RUN] 已创建目录: {dir_path}")
+                print(f"  [RUN] created directory: {dir_path}")
             
-            with open(file_path, mode, encoding=encoding) as f:
+            with open(safe_path, mode, encoding=encoding) as f:
                 f.write(content)
             
-            print(f"  [RUN] 已写入文件: {file_path}")
+            print(f"  [RUN] wrote file: {safe_path}")
             return True
             
         except Exception as e:
@@ -1968,7 +2153,10 @@ def _handle_run(p, ctx):
             return False
         
         if shell_mode:
-            print("  [RUN] 警告: 已启用 shell 模式，请仅运行可信宏")
+            if not ctx.get('allow_shell_mode', False):
+                print("  [RUN] error: shell mode is disabled by default; use normal argument mode")
+                return False
+            print("  [RUN] warning: shell mode is enabled for trusted macros only")
             run_cmd = f"{command} {args}" if args else command
         else:
             try:
@@ -2002,9 +2190,14 @@ def _handle_run(p, ctx):
             print("  [RUN] 错误: 未指定脚本路径")
             return False
         
-        # 检查脚本文件是否存在
+        # Check script existence and enforce the file sandbox
+        try:
+            script_path = _resolve_safe_file_path(script_path, ctx, 'RUN script')
+        except Exception as e:
+            print(f"  [RUN] error: {e}")
+            return False
         if not os.path.exists(script_path):
-            print(f"  [RUN] 错误: 脚本文件不存在: {script_path}")
+            print(f"  [RUN] error: script file does not exist: {script_path}")
             return False
         
         # 解释器映射
@@ -2016,7 +2209,10 @@ def _handle_run(p, ctx):
             'cmd': 'cmd',
             'bat': 'cmd',
         }
-        cmd = INTERPRETERS.get(interpreter, interpreter)
+        cmd = INTERPRETERS.get(interpreter)
+        if not cmd:
+            print(f"  [RUN] error: unsupported script interpreter: {interpreter}")
+            return False
         
         cmd_list = [cmd, script_path]
         if args:
@@ -2034,7 +2230,7 @@ def _handle_run(p, ctx):
 
 
 # ======================================================================
-# 宏数据校验（从 MacroAssistant.py 迁移，完成 1.7.0 Beta 中声明的迁移）
+# 宏数据校验（从 MacroMate.py 迁移，完成 1.7.0 Beta 中声明的迁移）
 # ======================================================================
 def validate_macro_data(data):
     """

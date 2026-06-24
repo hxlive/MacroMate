@@ -1,6 +1,6 @@
 # gui_utils.py
 # 描述：GUI 组件工厂与界面逻辑处理 (重构版)
-# 版本：1.7.3
+# 版本：1.8.0
 
 import sys
 import tkinter as tk
@@ -18,6 +18,11 @@ except ImportError:
     class HotkeyUtils:
         @staticmethod
         def format_hotkey_display(s): return s.upper()
+
+    class MacroSchema:
+        LANG_OPTIONS = {}
+        CLICK_OPTIONS = {}
+        ACTION_TRANSLATIONS = {}
 
 # =================================================================
 # 1. 基础工具函数
@@ -53,7 +58,7 @@ class AutoWrapLabel(ttk.Label):
 
 
 # ======================================================================
-# 参数控件工厂类（从 MacroAssistant.py 迁移）
+# 参数控件工厂类（从 MacroMate.py 迁移）
 # ======================================================================
 class ParamWidgetFactory:
     """
@@ -62,7 +67,7 @@ class ParamWidgetFactory:
     特性：
     - 无状态设计，所有方法都是纯函数
     - 通过构造函数传入必要的依赖（字体、回调函数等）
-    - 保持与原 MacroAssistant 中的方法接口一致
+    - 保持与原 MacroMate 中的方法接口一致
     """
 
     def __init__(self, font_ui, font_code, ocr_name_map=None):
@@ -77,6 +82,23 @@ class ParamWidgetFactory:
         self.font_ui = font_ui
         self.font_code = font_code
         self.ocr_name_map = ocr_name_map or {}
+
+    @staticmethod
+    def _noop(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def _trace_add_for_widget(var, mode, callback):
+        token = var.trace_add(mode, callback)
+        frame = getattr(var, '_param_frame', None)
+        if frame is not None:
+            def _cleanup(_event=None, v=var, t=token):
+                try:
+                    v.trace_remove(mode, t)
+                except Exception:
+                    pass
+            frame.bind('<Destroy>', _cleanup, add='+')
+        return token
 
     def create_param_entry(self, parent, key, label_text, default_value):
         """创建参数输入框"""
@@ -104,9 +126,9 @@ class ParamWidgetFactory:
         frame = ttk.Frame(parent)
         ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor="w")
         combo = ttk.Combobox(frame, values=values, state="readonly", width=23, font=self.font_ui)
-        if default and default in values:
+        if default and values and default in values:
             combo.set(default)
-        else:
+        elif values:
             combo.current(0)
         combo.pack(anchor="w", fill=tk.X)
         frame.pack(fill=tk.X, pady=8)
@@ -125,9 +147,9 @@ class ParamWidgetFactory:
         frame = ttk.Frame(parent)
         ttk.Label(frame, text=label_text, font=self.font_ui, width=15).pack(side=tk.LEFT, anchor="w")
         combo = ttk.Combobox(frame, values=values, state="readonly", width=20, font=self.font_ui)
-        if default and default in values:
+        if default and values and default in values:
             combo.set(default)
-        else:
+        elif values:
             combo.current(0)
         combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         frame.pack(fill=tk.X, pady=3)
@@ -287,8 +309,8 @@ class ParamWidgetFactory:
         on_test_find_image = callbacks.get('on_test_find_image_click')
         on_test_find_text = callbacks.get('on_test_find_text_click')
         on_test_ai_command = callbacks.get('on_test_ai_command_click')
-        update_loop_params_cb = callbacks.get('update_loop_params')
-        update_run_params_cb = callbacks.get('update_run_params')
+        update_loop_params_cb = callbacks.get('update_loop_params') or self._noop
+        update_run_params_cb = callbacks.get('update_run_params') or self._noop
         mouse_tracker = callbacks.get('mouse_tracker')
         mouse_pos_var = callbacks.get('mouse_pos_var')
 
@@ -334,7 +356,7 @@ class ParamWidgetFactory:
                     ef.pack(fill=tk.X, pady=8); hint.pack(anchor="w", pady=5, fill=tk.X)
                 else:
                     ef.pack_forget(); hint.pack_forget()
-            param_widgets['save_to_clipboard'].trace_add('write', lambda *_: _toggle_ft())
+            self._trace_add_for_widget(param_widgets['save_to_clipboard'], 'write', lambda *_: _toggle_ft())
             self.create_test_button(parent_frame, "🧪 测试查找文本 (OCR)", on_test_find_text)
             
         elif action_key == 'MOVE_OFFSET':
@@ -411,8 +433,10 @@ class ParamWidgetFactory:
             param_widgets['y'] = self.create_param_entry(parent_frame, "y", "Y 坐标:", "100")
             ttk.Separator(parent_frame, orient='horizontal').pack(fill='x', pady=(15, 5))
             ttk.Label(parent_frame, text="当前鼠标位置 (参考):", font=self.font_ui, foreground='gray').pack(anchor="w", pady=(5,0))
-            ttk.Label(parent_frame, textvariable=mouse_pos_var, font=self.font_code, bootstyle="info").pack(anchor="w")
-            mouse_tracker.start()
+            if mouse_pos_var is not None:
+                ttk.Label(parent_frame, textvariable=mouse_pos_var, font=self.font_code, bootstyle="info").pack(anchor="w")
+            if mouse_tracker is not None:
+                mouse_tracker.start()
             
         elif action_key == 'IF_IMAGE_FOUND':
             param_widgets['path'] = self.create_param_entry(parent_frame, "path", "图像路径:", "button.png")
@@ -440,7 +464,7 @@ class ParamWidgetFactory:
                     ef.pack(fill=tk.X, pady=8); hint.pack(anchor="w", pady=5, fill=tk.X)
                 else:
                     ef.pack_forget(); hint.pack_forget()
-            param_widgets['save_to_clipboard'].trace_add('write', lambda *_: _toggle_ift())
+            self._trace_add_for_widget(param_widgets['save_to_clipboard'], 'write', lambda *_: _toggle_ift())
             self.create_test_button(parent_frame, "🧪 测试 IF 文本", on_test_find_text)
             
         elif action_key == 'LOOP_START':
@@ -495,11 +519,11 @@ class ParamWidgetFactory:
             self.create_hint_label(parent_frame, "* 提示: 支持 data.list[0].price、$.data.name、items[0]['title'] 等路径；勾选默认值后可留空，表示失败时保存空字符串。")
 
         elif action_key == 'PROMPT_INPUT':
-            param_widgets['title'] = self.create_param_entry(parent_frame, "title", "询问窗口标题:", "宏助手人工输入")
+            param_widgets['title'] = self.create_param_entry(parent_frame, "title", "询问窗口标题:", "智点助手人工输入")
             param_widgets['prompt'] = self.create_param_entry(parent_frame, "prompt", "询问内容:", "请输入验证码")
             param_widgets['default_value'] = self.create_param_entry(parent_frame, "default_value", "默认值(可选):", "")
             param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "user_input")
-            self.create_hint_label(parent_frame, "* 提示: 这是宏助手主动询问用户，不是识别其他软件或网页弹窗；取消输入会安全停止宏。")
+            self.create_hint_label(parent_frame, "* 提示: 这是智点助手主动询问用户，不是识别其他软件或网页弹窗；取消输入会安全停止宏。")
 
         elif action_key == 'FOREACH_LINE':
             param_widgets['file_path'] = self.create_compact_entry(parent_frame, "file_path", "数据文件:", "")
@@ -574,7 +598,7 @@ class ParamWidgetFactory:
                                 return None, f"参数 '{k}' 必须是非负整数"
                             if parsed_int < 0:
                                 return None, f"参数 '{k}' 必须是非负整数"
-                            if k in ('max_jumps', 'max_lines') and parsed_int <= 0:
+                            if k in ('max_iterations', 'max_jumps', 'max_lines') and parsed_int <= 0:
                                 return None, f"参数 '{k}' 必须大于 0"
                         elif k == 'timeout':
                             # [P2修复] timeout 要求正整数，≤0 无意义
@@ -738,7 +762,7 @@ class ParamWidgetFactory:
 
 
 # ======================================================================
-# 参数动态显示控制函数（从 MacroAssistant.py 迁移）
+# 参数动态显示控制函数（从 MacroMate.py 迁移）
 # ======================================================================
 def update_loop_params(param_widgets, param_frame, mode_widget):
     """
@@ -866,7 +890,7 @@ def update_run_params(param_widgets, param_frame, run_type_widget):
 
 
 # ======================================================================
-# 参数转换工具函数（从 MacroAssistant.py 迁移）
+# 参数转换工具函数（从 MacroMate.py 迁移）
 # ======================================================================
 def param_display_to_internal(key, display_value, ocr_name_map, lang_options, click_options):
     """
@@ -934,7 +958,7 @@ def param_internal_to_display(key, internal_value, ocr_name_map, lang_values_to_
 
 
 # ======================================================================
-# 工具函数（从 MacroAssistant.py 迁移）
+# 工具函数（从 MacroMate.py 迁移）
 # ======================================================================
 def resource_path(relative_path):
     """获取资源文件路径，支持打包后环境"""
@@ -945,7 +969,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-def get_icon_path(icon_name="app_icon.ico", app_version="1.7.1"):
+def get_icon_path(icon_name="app_icon.ico", app_version="1.8.0"):
     """
     获取图标路径,打包后从临时目录提取
     返回可用于 iconbitmap() 的实际文件路径
@@ -978,7 +1002,7 @@ def get_icon_path(icon_name="app_icon.ico", app_version="1.7.1"):
 
         # 创建临时文件
         temp_dir = tempfile.gettempdir()
-        temp_icon = os.path.join(temp_dir, f"macroassistant_{app_version}.ico")
+        temp_icon = os.path.join(temp_dir, f"macromate_{app_version}.ico")
 
         # 复制图标到临时目录
         shutil.copy2(source_icon, temp_icon)
@@ -988,3 +1012,4 @@ def get_icon_path(icon_name="app_icon.ico", app_version="1.7.1"):
     except Exception as e:
         print(f"[错误] 提取图标失败: {e}")
         return None
+

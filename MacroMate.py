@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-# MacroAssistant.py
+# MacroMate.py
 # 描述: 自动化宏的 GUI 界面
-# 版本: 1.7.3
-# 变更: 迁移部分代码至sys_utils.py和gui_utils.py,并修复一些小bug和优化了代码结构
-        
+# 版本: 1.8.0
+
 
 # 使用: 
-#   - GUI 模式: python MacroAssistant.py
-#   - 命令行: python MacroAssistant.py script.json
-#             python MacroAssistant.py --run script.json
-#             python MacroAssistant.py --theme darkly (指定主题)
+#   - GUI 模式: python MacroMate.py
+#   - 命令行: python MacroMate.py script.json
+#             python MacroMate.py --run script.json
+#             python MacroMate.py --theme darkly (指定主题)
 
 import os
 import sys
@@ -17,9 +16,13 @@ import sys
 # 允许在最早期通过命令行覆写日志编码（必须在 init_system_runtime 前）
 for i, arg in enumerate(sys.argv):
     if arg.startswith('--log-encoding='):
-        os.environ['MACROASSISTANT_STDIO_ENCODING'] = arg.split('=', 1)[1].strip()
+        _stdio_encoding = arg.split('=', 1)[1].strip()
+        os.environ['MACROMATE_STDIO_ENCODING'] = _stdio_encoding
+        os.environ['MACROASSISTANT_STDIO_ENCODING'] = _stdio_encoding
     elif arg == '--log-encoding' and i + 1 < len(sys.argv):
-        os.environ['MACROASSISTANT_STDIO_ENCODING'] = sys.argv[i + 1].strip()
+        _stdio_encoding = sys.argv[i + 1].strip()
+        os.environ['MACROMATE_STDIO_ENCODING'] = _stdio_encoding
+        os.environ['MACROASSISTANT_STDIO_ENCODING'] = _stdio_encoding
 
 import sys_utils  # [新增] 系统底层工具与初始化
 sys_utils.init_system_runtime() # [新增] 初始化 DPI 感知与流重定向
@@ -33,6 +36,8 @@ import copy
 import ttkbootstrap as tb
 import queue
 import ctypes
+ctypes.pythonapi.PyThreadState_SetAsyncExc.argtypes = [ctypes.c_ulong, ctypes.py_object]
+ctypes.pythonapi.PyThreadState_SetAsyncExc.restype = ctypes.c_int
 from PIL import Image, ImageGrab, ImageTk
 import webbrowser
 
@@ -40,14 +45,15 @@ import webbrowser
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.7.3"
-APP_TITLE = f"宏助手 (Macro Assistant) v{APP_VERSION}"
+APP_VERSION = "1.8.0"
+APP_TITLE = f"智点助手 (MacroMate) v{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
-CONFIG_FILE = "macro_settings.json"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.json")
 MAX_RECENT_FILES = 5
 
-DEFAULT_HOTKEY_RUN = "Ctrl+F10"
-DEFAULT_HOTKEY_STOP = "Ctrl+F11"
+DEFAULT_HOTKEY_RUN = "ctrl+f10"
+DEFAULT_HOTKEY_STOP = "ctrl+f11"
 # =================================================================
 # 性能优化常量
 STATUS_QUEUE_CHECK_INTERVAL_IDLE = 500  # 空闲时状态队列检查间隔（毫秒）
@@ -128,15 +134,14 @@ class MacroApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
         
         # 设置窗口图标 (确保任务栏显示)
-        icon_path = get_icon_path()
+        icon_path = get_icon_path(APP_ICON, APP_VERSION)
         if icon_path and os.path.exists(icon_path):
-            try: 
-                self.root.iconbitmap(icon_path)
-                print(f"[Info] 图标已设置: {icon_path}")
-                
-                # [重构] 使用 sys_utils 设置 AppUserModelID
+            try:
+                # Set AppUserModelID before iconbitmap for taskbar icon stability.
                 sys_utils.set_windows_app_id(APP_VERSION)
-                print(f"[Info] AppUserModelID 已设置: {APP_VERSION}")
+                print(f"[Info] AppUserModelID set: {APP_VERSION}")
+                self.root.iconbitmap(icon_path)
+                print(f"[Info] icon set: {icon_path}")
             except Exception as e: 
                 print(f"[错误] 设置图标失败: {e}")
         else:
@@ -509,7 +514,7 @@ class MacroApp:
             self._about_dialog_ref.dialog.focus_force()
             return
             
-        icon_path = get_icon_path()
+        icon_path = get_icon_path(APP_ICON, APP_VERSION)
         self._about_dialog_ref = AboutDialog(self.root, APP_VERSION, icon_path)
 
 
@@ -960,7 +965,10 @@ class MacroApp:
             cache_str = ""
             if 'region' in display_params or 'cache_box' in display_params:
                 box = display_params.pop('region', display_params.pop('cache_box', None))
-                cache_str = f"[区域: {box[0]},{box[1]},{box[2]},{box[3]}] "
+                if isinstance(box, (list, tuple)) and len(box) >= 4:
+                    cache_str = f"[区域: {box[0]},{box[1]},{box[2]},{box[3]}] "
+                elif box is not None:
+                    cache_str = f"[区域: 无效] "
 
             if 'engine' in display_params:
                 # <--- 列表显示时也使用完整映射
@@ -1143,7 +1151,7 @@ class MacroApp:
             self.root.after(0, self.run_macro, True)
         
     def safe_stop_macro(self):
-        """[即时中断] 通过 ctypes 向执行线程注入异常，无论其封锁在哪个阶段都能立刻中断。"""
+        """Request a cooperative macro stop; force-inject only as a delayed fallback."""
         if self._stop_in_progress:
             return
         if self._run_pending:
@@ -1151,34 +1159,45 @@ class MacroApp:
             if self._pending_run_id is not None:
                 self.root.after_cancel(self._pending_run_id)
                 self._pending_run_id = None
-            self.status_var.set("已取消待执行的宏")
+            self.status_var.set("\u5df2\u53d6\u6d88\u5f85\u6267\u884c\u7684\u5b8f")
             self._restore_macro_idle_ui()
             return
         if not self.is_macro_running:
             return
         self._stop_in_progress = True
-        self.root.after(0, self.status_var.set, "正在停止...")
-        # 同时设置标志位（兼容 WAIT 内的分段检查）
+        self.root.after(0, self.status_var.set, "\u6b63\u5728\u505c\u6b62...")
         if self.current_run_context:
             self.current_run_context['stop_requested'] = True
             macro_engine.cleanup_active_processes(self.current_run_context)
-        # 强制向执行线程注入 MacroStopException
+        self.root.after(2500, self._force_stop_macro_if_needed)
+
+    def _force_stop_macro_if_needed(self):
+        """Last-resort stop for code paths that do not reach cooperative checks."""
+        if not self._stop_in_progress or not self.is_macro_running:
+            return
         t = self._macro_thread
-        if t and t.is_alive():
-            tid = t.ident
-            if tid:
-                res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                    ctypes.c_ulong(tid),
-                    ctypes.py_object(macro_engine.MacroStopException)
-                )
-                if res == 0:
-                    print("[中断] 警告: 线程 ID 无效，异常未注入")
-                elif res > 1:
-                    # 多个线程被影响，需要撤销
-                    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
-                    print("[中断] 警告: 异常影响了多个线程，已撤销")
-                else:
-                    print("[中断] MacroStopException 已弹射到执行线程")
+        if not (t and t.is_alive()):
+            return
+        tid = t.ident
+        if not tid:
+            print("\u4e2d\u65ad: thread ID invalid; exception not injected")
+            return
+        if not (self.current_run_context or {}).get('allow_force_thread_stop', False):
+            print("Stop: cooperative stop timed out; force thread injection is disabled")
+            if self.current_run_context:
+                macro_engine.cleanup_active_processes(self.current_run_context)
+            return
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(tid),
+            ctypes.py_object(macro_engine.MacroStopException)
+        )
+        if res == 0:
+            print("Stop: thread ID invalid; exception not injected")
+        elif res > 1:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+            print("Stop: exception affected multiple threads and was reverted")
+        else:
+            print("Stop: cooperative stop timed out; MacroStopException injected")
         
     def run_macro(self, hotkey=False):
         if self.is_macro_running or self._run_pending or not self.steps: return
@@ -1209,6 +1228,12 @@ class MacroApp:
         
         # [新增] 创建迷你状态栏窗口（在最小化前）
         if not self.dont_minimize_var.get():
+            if getattr(self, 'mini_status_window', None):
+                try:
+                    self.mini_status_window.destroy()
+                except Exception:
+                    pass
+                self.mini_status_window = None
             self.mini_status_window = MiniStatusWindow(self.root, self.safe_stop_macro)
             self.mini_status_window.update_status(
                 f"宏正在运行... [点击停止 或 {stop_display}]",
@@ -1224,11 +1249,14 @@ class MacroApp:
         self._run_pending = False
         self._pending_run_id = None
         self.is_macro_running = True
+        macro_base_dir = os.path.dirname(self.current_filepath) if self.current_filepath else os.getcwd()
         self.current_run_context = {
             'stop_requested': False,
             'stop_key_str': self.hotkey_stop_str.get(),
             'enhanced_mode': self.enhanced_mode_var.get(),
             'run_enabled': self.run_enabled_var.get(),
+            'macro_base_dir': macro_base_dir,
+            'allowed_file_roots': [macro_base_dir, os.getcwd(), APP_DIR],
             'prompt_input_callback': self._prompt_input_for_macro,
         }
         self._macro_thread = threading.Thread(target=self._run, args=(copy.deepcopy(self.steps),), daemon=True)
@@ -1240,12 +1268,15 @@ class MacroApp:
 
         def ask():
             try:
+                if ctx and ctx.get('stop_requested'):
+                    done.set()
+                    return
                 if self.root.winfo_exists():
                     self.root.deiconify()
                     self.root.attributes('-topmost', True)
                     self.root.lift()
                 result['value'] = simpledialog.askstring(
-                    title or "宏助手输入",
+                    title or "智点助手输入",
                     prompt or "请输入内容:",
                     initialvalue=default_value or "",
                     parent=self.root
@@ -1291,6 +1322,8 @@ class MacroApp:
     def _on_macro_complete(self):
         self.is_macro_running = False
         self._stop_in_progress = False
+        if self.current_run_context:
+            macro_engine.cleanup_active_processes(self.current_run_context)
         self.current_run_context = None
 
         self._restore_macro_idle_ui()
@@ -1419,7 +1452,7 @@ class MacroApp:
                     self.run_enabled_var.set(d.get('run_enabled', False))
                     self.skip_confirm_var.set(d.get('skip_confirm', False))
                     self.dont_minimize_var.set(d.get('dont_minimize', False))
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, TypeError) as e:
             print(f"[设置] 加载应用设置失败: {e}")
         self.root.style.theme_use(self.current_theme.get())
 
@@ -1433,7 +1466,7 @@ class MacroApp:
                         settings = json.load(f)
                     if not isinstance(settings, dict):
                         settings = {}
-                except Exception:
+                except (OSError, json.JSONDecodeError, TypeError):
                     settings = {}
             settings.update({
                 'recent_files': self.recent_files,
@@ -1449,7 +1482,7 @@ class MacroApp:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, CONFIG_FILE)
-        except Exception as e:
+        except (OSError, TypeError) as e:
             print(f"[设置] 保存应用设置失败: {e}")
 
     def change_theme(self):
@@ -1464,7 +1497,7 @@ if __name__ == "__main__":
     import argparse
     
     # 命令行参数解析
-    parser = argparse.ArgumentParser(description='MacroAssistant - 自动化宏工具')
+    parser = argparse.ArgumentParser(description='MacroMate - 智点助手，智能桌面自动化工具')
     parser.add_argument('script_file', nargs='?', help='要执行的脚本文件 (.json)')
     parser.add_argument('--run', dest='run', help='执行指定脚本文件 (效果同直接传参)')
     parser.add_argument('--enable-run', action='store_true', help='允许命令行模式执行 RUN 步骤；默认禁用')
@@ -1503,7 +1536,12 @@ if __name__ == "__main__":
             
             # 执行脚本
             print(f"[CLI] Total steps: {len(steps)}, running...")
-            run_context = {'run_enabled': args.enable_run}
+            macro_base_dir = os.path.dirname(os.path.abspath(script_file))
+            run_context = {
+                'run_enabled': args.enable_run,
+                'macro_base_dir': macro_base_dir,
+                'allowed_file_roots': [macro_base_dir, os.getcwd(), APP_DIR],
+            }
             if not args.enable_run:
                 print("[CLI] RUN steps are disabled by default. Use --enable-run to allow RUN actions.")
             result = macro_engine.execute_steps(steps, run_context=run_context)
@@ -1530,9 +1568,15 @@ if __name__ == "__main__":
         try:
             theme = args.theme
             if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f: theme = json.load(f).get('theme', 'litera')
-        except Exception:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    theme_config = json.load(f)
+                if isinstance(theme_config, dict):
+                    theme = theme_config.get('theme', 'litera')
+        except (OSError, json.JSONDecodeError, TypeError):
             pass
         main_window = tb.Window(themename=theme)
         app = MacroApp(main_window)
         main_window.mainloop()
+
+
+
