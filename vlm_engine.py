@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vlm_engine.py
 # 描述: 大模型视觉语言引擎 - 接入支持图片理解的大模型 API
-# 版本: 1.1.2
+# Version: 1.1.5
 # 功能: 将屏幕截图转为 Base64，连同自然语言指令发送给 VLM API，返回坐标
 
 import base64
@@ -20,13 +20,19 @@ except ImportError:
     REQUESTS_AVAILABLE = False
     print("[VLM] FAIL 未找到 requests 库 (pip install requests)")
 
-from PIL import Image, ImageGrab
+from PIL import ImageGrab
 
 # ======================================================================
 # 全局配置
 # ======================================================================
-APP_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "macro_settings.json")
-VLM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_settings.json")
+def _get_program_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = _get_program_dir()
+APP_CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.json")
 VLM_CONFIG_KEY = "vlm"
 
 # 默认配置
@@ -38,6 +44,16 @@ DEFAULT_CONFIG = {
     "timeout": 30,
     "system_prompt": "你是一个自动化助手。请分析用户指令和屏幕截图，返回目标位置的坐标。只返回 X, Y 坐标数字，用英文逗号分隔，例如: 123,456。如果找不到目标，返回 none"
 }
+
+_COORDINATE_PATTERNS = tuple(re.compile(pattern) for pattern in (
+    r'(-?\d+)\s*[,，]\s*(-?\d+)\s*[,，]\s*(-?\d+)\s*[,，]\s*(-?\d+)',
+    r'(-?\d+)\s*[,，]\s*(-?\d+)',
+    r'x\s*[:=]\s*(-?\d+)\s*[,，]?\s*y\s*[:=]\s*(-?\d+)',
+    r'(-?\d+)\s*[,，]\s*(-?\d+).*(?:坐标|location)',
+    r'位于\s*[（(]?\s*(-?\d+)\s*[,，]\s*(-?\d+)\s*[）)]?',
+    r'(-?\d+)px?\s*[,，]\s*(-?\d+)px?',
+    r'^\s*(?:coordinate|position|location|point)?\s*[:：]?\s*(-?\d+)\s+(-?\d+)\s*$',
+))
 
 # 提供商配置
 PROVIDER_CONFIGS = {
@@ -125,9 +141,30 @@ def _merge_user_config(default, user_config):
 def _load_user_config():
     app_config = _read_json_file(APP_CONFIG_FILE)
     vlm_config = app_config.get(VLM_CONFIG_KEY)
-    if isinstance(vlm_config, dict):
-        return vlm_config
-    return _read_json_file(VLM_CONFIG_FILE)
+    return vlm_config if isinstance(vlm_config, dict) else {}
+
+
+def _get_env_api_key(provider):
+    provider_key = re.sub(r'[^A-Za-z0-9]+', '_', str(provider or '')).upper().strip('_')
+    env_names = []
+    if provider_key:
+        env_names.append(f"MACROMATE_{provider_key}_API_KEY")
+    env_names.append("MACROMATE_VLM_API_KEY")
+    for name in env_names:
+        value = os.environ.get(name, '').strip()
+        if value:
+            return value
+    return ''
+
+
+def _apply_runtime_secret_config(cfg):
+    runtime_cfg = cfg.copy()
+    if not runtime_cfg.get('api_key'):
+        env_key = _get_env_api_key(runtime_cfg.get('provider', 'openai'))
+        if env_key:
+            runtime_cfg['api_key'] = env_key
+            runtime_cfg['_api_key_source'] = 'env'
+    return runtime_cfg
 
 
 # ======================================================================
@@ -160,8 +197,10 @@ def save_config(config):
     global _vlm_config
     with _vlm_lock:
         try:
-            app_config = _read_json_file(APP_CONFIG_FILE)
+            read_path = APP_CONFIG_FILE
+            app_config = _read_json_file(read_path)
             app_config[VLM_CONFIG_KEY] = config
+            os.makedirs(os.path.dirname(APP_CONFIG_FILE), exist_ok=True)
             tmp_path = APP_CONFIG_FILE + '.tmp'
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(app_config, f, ensure_ascii=False, indent=2)
@@ -290,19 +329,8 @@ def parse_coordinates(response_text):
     if 'none' in text or '找不到' in text or '未找到' in text or '无法' in text:
         return None
     
-    # 尝试多种匹配模式
-    patterns = [
-        r'(-?\d+)\s*[,，]\s*(-?\d+)\s*[,，]\s*(-?\d+)\s*[,，]\s*(-?\d+)',  # 4个坐标: 899,1326,924,1344
-        r'(-?\d+)\s*[,，]\s*(-?\d+)',           # 2个坐标: 123,456 或 123，456
-        r'x\s*[:=]\s*(-?\d+)\s*[,，]?\s*y\s*[:=]\s*(-?\d+)',  # x:123, y:456
-        r'(-?\d+)\s*[,，]\s*(-?\d+).*(?:坐标|location)',  # 123,456 坐标
-        r'位于\s*[（(]?\s*(-?\d+)\s*[,，]\s*(-?\d+)\s*[）)]?',  # 位于 (123,456)
-        r'(-?\d+)px?\s*[,，]\s*(-?\d+)px?',     # 带单位: 123px, 456px
-        r'^\s*(?:coordinate|position|location|point)?\s*[:：]?\s*(-?\d+)\s+(-?\d+)\s*$',  # 整段只有一个空格分隔坐标
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text)
+    for pattern in _COORDINATE_PATTERNS:
+        match = pattern.search(text)
         if match:
             try:
                 groups = match.groups()
@@ -503,7 +531,7 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
         if raise_on_error: raise RuntimeError(err_msg)
         return None
 
-    cfg = config if config else load_config()
+    cfg = _apply_runtime_secret_config(config if config else load_config())
     if not cfg.get('api_key'):
         err_msg = "[VLM] FAIL API key is not configured"
         print(err_msg)
@@ -621,4 +649,4 @@ def test_vlm():
         print("[VLM] 未找到坐标")
 
 
-vlm_engine_version = "1.1.2"
+vlm_engine_version = "1.1.5"

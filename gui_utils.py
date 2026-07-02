@@ -1,12 +1,11 @@
 # gui_utils.py
 # 描述：GUI 组件工厂与界面逻辑处理 (重构版)
-# 版本：1.8.0
+# 版本：1.8.1
 
 import sys
 import tkinter as tk
 from tkinter import filedialog
 import ttkbootstrap as ttk
-from PIL import Image, ImageTk
 import os
 import re
 
@@ -23,10 +22,316 @@ except ImportError:
         LANG_OPTIONS = {}
         CLICK_OPTIONS = {}
         ACTION_TRANSLATIONS = {}
+        RUN_TYPE_OPTIONS = {'command (命令)': 'command', 'script (脚本)': 'script'}
+        RUN_TYPE_DISPLAY_BY_VALUE = {v: k for k, v in RUN_TYPE_OPTIONS.items()}
 
 # =================================================================
 # 1. 基础工具函数
 # =================================================================
+LOOP_MODE_OPTIONS = {
+    '固定次数': 'fixed',
+    '直到找到图像': 'until_image',
+    '直到找到文本': 'until_text',
+}
+LOOP_MODE_DISPLAY_BY_VALUE = {v: k for k, v in LOOP_MODE_OPTIONS.items()}
+
+_LOOP_PARAM_KEYS = ('times', 'condition_image', 'confidence', 'condition_text', 'lang', 'max_iterations', 'region')
+_LOOP_VISIBLE_PARAMS = {
+    'fixed': ('times',),
+    'until_image': ('condition_image', 'confidence', 'max_iterations', 'region'),
+    'until_text': ('condition_text', 'lang', 'max_iterations', 'region'),
+}
+_RUN_COMMAND_PARAMS = ('command', 'args', 'timeout', 'cwd', 'save_output', 'shell_mode', 'fail_stop')
+_RUN_SCRIPT_PARAMS = ('script_path', 'interpreter', 'args', 'timeout', 'cwd', 'save_output', 'fail_stop')
+_RUN_VISIBLE_PARAMS = {
+    'command': _RUN_COMMAND_PARAMS,
+    'script': _RUN_SCRIPT_PARAMS,
+}
+_RUN_PARAM_KEYS = tuple(sorted(set(_RUN_COMMAND_PARAMS + _RUN_SCRIPT_PARAMS)))
+
+_OPTIONAL_PARAM_KEYS = {
+    '*': {'region', 'extract_pattern', 'save_to_var'},
+    'SET_VAR': {'var_value'},
+    'WRITE_FILE': {'content', 'append'},
+    'JSON_EXTRACT': {'default_value', 'json_path'},
+    'PROMPT_INPUT': {'default_value'},
+    'FOREACH_LINE': {'file_path', 'source_text', 'split_delimiter', 'field_names'},
+    'IF_VAR': {'var_value', 'expected_val'},
+    'GOTO_IF': {'var_value', 'expected_val'},
+    'SCROLL': {'x', 'y'},
+    'CLICK': {'x', 'y', 'clicks', 'interval', 'duration'},
+}
+_EMPTY_SKIP_ACTIONS = {'ELSE', 'END_IF', 'END_LOOP', 'END_FOREACH', 'NOTE', 'RUN'}
+_NUMERIC_PARAM_KEYS = {'x', 'y', 'ms', 'times', 'x_offset', 'y_offset', 'amount', 'max_iterations', 'max_jumps', 'max_lines', 'retry_count', 'timeout', 'clicks', 'interval', 'duration'}
+_NON_NEGATIVE_INT_PARAM_KEYS = {'ms', 'times', 'max_iterations', 'max_jumps', 'max_lines', 'retry_count', 'clicks'}
+_NON_NEGATIVE_FLOAT_PARAM_KEYS = {'interval', 'duration'}
+_POSITIVE_INT_PARAM_KEYS = {'max_iterations', 'max_jumps', 'max_lines'}
+_RUN_DEFAULT_OMIT_PARAMS = {
+    'timeout': '30',
+    'interpreter': 'python',
+    'encoding': 'utf-8',
+}
+_RUN_FALSE_OMIT_PARAMS = {'append', 'save_output', 'shell_mode', 'fail_stop'}
+_LOOP_REQUIRED_PARAMS = {
+    'fixed': ('times', "参数 'times' 不能为空"),
+    'until_image': ('condition_image', "参数 'condition_image' 不能为空"),
+    'until_text': ('condition_text', "参数 'condition_text' 不能为空"),
+}
+
+
+_SIMPLE_ACTION_FORM_FIELDS = {
+    'MOVE_OFFSET': (
+        ('entry', 'x_offset', 'X 偏移:', '10', None),
+        ('entry', 'y_offset', 'Y 偏移:', '0', None),
+    ),
+    'CLICK': (
+        ('combobox', 'button', '按键:', None, lambda: list(MacroSchema.CLICK_OPTIONS.keys())),
+        ('entry', 'x', 'X 坐标 (可选, 留空=当前位置):', '', None),
+        ('entry', 'y', 'Y 坐标 (可选, 留空=当前位置):', '', None),
+        ('entry', 'clicks', '点击次数 (可选, 默认1):', '', None),
+        ('entry', 'interval', '点击间隔秒 (可选, 默认0):', '', None),
+        ('entry', 'duration', '按下持续秒 (可选, 默认0):', '', None),
+    ),
+    'SCROLL': (
+        ('entry', 'amount', '滚动量 (正数=上, 负数=下):', '100', None),
+        ('entry', 'x', 'X 坐标 (可选):', '', None),
+        ('entry', 'y', 'Y 坐标 (可选):', '', None),
+    ),
+    'WAIT': (
+        ('entry', 'ms', '等待 (毫秒):', '500', None),
+    ),
+    'TYPE_TEXT': (
+        ('entry', 'text', '输入文本:', '你好', None),
+    ),
+    'PRESS_KEY': (
+        ('entry', 'key', '按键或组合键 (Enter, Ctrl+C):', 'Enter', None),
+    ),
+    'ACTIVATE_WINDOW': (
+        ('entry', 'title', '窗口标题 (支持部分匹配):', '记事本', None),
+    ),
+    'NOTE': (
+        ('entry', 'text', '备注内容:', '这里是需要备注的文本...', None),
+    ),
+    'GOTO_LABEL': (
+        ('entry', 'label', '目标标签名:', '重试登录', None),
+        ('entry', 'max_jumps', '最大跳转次数(安全阀):', '100', None),
+    ),
+    'SET_VAR': (
+        ('entry', 'var_name', '变量名:', 'my_var', None),
+        ('entry', 'var_value', '变量值:', '123', None),
+    ),
+    'CALCULATE': (
+        ('entry', 'expression', '变量计算表达式:', '({price} * 1.5) + 10', None),
+        ('entry', 'var_name', '保存至变量:', 'final_price', None),
+        ('checkbox', 'fail_stop', '[警告] 计算失败时停止宏', False, None),
+    ),
+}
+
+_SIMPLE_ACTION_HINTS = {
+    'CLICK': '* 提示: X/Y 留空则在当前鼠标位置点击；clicks/interval/duration 留空则使用默认值（1次/0秒/0秒）。',
+    'SCROLL': '* 提示: 如果 X, Y 为空，将在当前鼠标位置滚动。',
+    'TYPE_TEXT': "* 此功能使用剪贴板 (Ctrl+V)，以支持中文及复杂文本输入。\n* 支持占位符: {CLIPBOARD} 将替换为剪贴板内容\n* 示例: '订单号: {CLIPBOARD}' → '订单号: 12345'",
+    'ACTIVATE_WINDOW': '* 提示: 宏将查找标题中包含此文本的窗口，并将其激活到最前端。',
+    'NOTE': '* 注意: 此步骤仅作为注释，不会执行任何操作。\n* 备注内容以 LABEL: 或 标签: 开头时，可作为“跳转到标签”的目标。\n* 示例: LABEL: 重试登录',
+    'SET_VAR': '* 提示: 变量名无需大括号，变量值支持 {其他变量} 插值。',
+    'CALCULATE': '* 提示: 用来把已识别或读取到的变量做加减乘除，例如价格、数量、序号；不适合当作普通计算器使用。',
+}
+
+_SIMPLE_ACTION_INSTRUCTIONS = {
+    'GOTO_LABEL': ('使用说明', (
+        '先添加一个“备注”步骤作为标签，例如: LABEL: 重试登录',
+        '本步骤只填写标签名，例如: 重试登录',
+        '标签名必须唯一；重复或找不到都会停止执行',
+        '每个跳转步骤默认最多跳转 100 次，防止死循环',
+    )),
+}
+
+
+
+def _is_optional_empty_param(action_key, param_key):
+    return (
+        param_key in _OPTIONAL_PARAM_KEYS.get('*', set())
+        or param_key in _OPTIONAL_PARAM_KEYS.get(action_key, set())
+    )
+
+
+def _copy_present_params(params, keys):
+    return {k: params[k] for k in keys if k in params}
+
+
+def _is_default_or_empty_param(key, value):
+    if key in _RUN_DEFAULT_OMIT_PARAMS and value == _RUN_DEFAULT_OMIT_PARAMS[key]:
+        return True
+    if key in _RUN_FALSE_OMIT_PARAMS and not value:
+        return True
+    return value is None or (not isinstance(value, bool) and not str(value).strip())
+
+
+def _prune_run_params(params, keep_keys):
+    return {
+        k: v
+        for k, v in _copy_present_params(params, keep_keys).items()
+        if not _is_default_or_empty_param(k, v)
+    }
+
+
+def _validate_numeric_param(key, value):
+    if key not in _NUMERIC_PARAM_KEYS or not value:
+        return None
+
+    text = str(value).strip()
+    if key in _NON_NEGATIVE_INT_PARAM_KEYS:
+        try:
+            parsed_int = int(text)
+        except (ValueError, TypeError):
+            return f"parameter '{key}' must be a non-negative integer"
+        if parsed_int < 0:
+            return f"parameter '{key}' must be a non-negative integer"
+        if key in _POSITIVE_INT_PARAM_KEYS and parsed_int <= 0:
+            return f"parameter '{key}' must be greater than 0"
+        return None
+
+    if key == 'timeout':
+        try:
+            parsed_timeout = int(text)
+        except (ValueError, TypeError):
+            return "parameter 'timeout' must be a positive integer"
+        if parsed_timeout <= 0:
+            return "parameter 'timeout' must be greater than 0"
+        return None
+
+    if key in _NON_NEGATIVE_FLOAT_PARAM_KEYS:
+        try:
+            parsed_float = float(text)
+        except (ValueError, TypeError):
+            return f"parameter '{key}' must be a non-negative number"
+        if parsed_float < 0:
+            return f"parameter '{key}' must be a non-negative number"
+        return None
+
+    try:
+        int(text)
+    except (ValueError, TypeError):
+        return f"parameter '{key}' must be an integer"
+    return None
+
+
+def _validate_confidence(value):
+    if not value:
+        return None
+    try:
+        confidence = float(str(value).strip())
+    except (ValueError, TypeError):
+        return "参数 'confidence' 必须是数字（如 0.8）"
+    if not (0.0 < confidence <= 1.0):
+        return "参数 'confidence' 必须在 0.0 ~ 1.0 之间"
+    return None
+
+
+def _validate_retry_interval(value):
+    if not value:
+        return None
+    try:
+        if float(str(value).strip()) < 0:
+            return "参数 'retry_interval' 必须大于等于 0"
+    except (ValueError, TypeError):
+        return "参数 'retry_interval' 必须是数字（如 0.5）"
+    return None
+
+
+def _convert_param_value(key, value, engine_key_map=None):
+    if key == 'mode':
+        return LOOP_MODE_OPTIONS.get(value, 'fixed'), None, True
+    if key == 'run_type':
+        return MacroSchema.RUN_TYPE_OPTIONS.get(value, 'command'), None, True
+    if key == 'lang':
+        return MacroSchema.LANG_OPTIONS.get(value, 'eng'), None, True
+    if key == 'button':
+        return MacroSchema.CLICK_OPTIONS.get(value, 'left'), None, True
+    if key == 'engine':
+        if engine_key_map:
+            return engine_key_map.get(value, 'auto'), None, True
+        return value.split(' ')[0], None, True
+    if key == 'region':
+        if not value.strip():
+            return None, None, False
+        coords = parse_region_string(value)
+        if not coords:
+            return None, "参数 'region' 格式无效，应为 x1, y1, x2, y2", False
+        if coords[2] <= coords[0] or coords[3] <= coords[1]:
+            return None, "参数 'region' 必须满足 x2 > x1 且 y2 > y1", False
+        return coords, None, True
+    if key == 'extract_pattern' and not value.strip():
+        return None, None, False
+    return value, None, True
+
+
+def _sanitize_run_params(params):
+    run_type = params.get('run_type', 'command')
+    if run_type == 'command' and not params.get('command'):
+        return None, "RUN 命令类型必须填写 '命令'"
+    if run_type == 'script' and not params.get('script_path'):
+        return None, "RUN 脚本类型必须填写 '脚本路径'"
+    if run_type == 'file':
+        return None, 'RUN 文件写入模式已禁用，请改用 WRITE_FILE'
+
+    keep_keys = ('run_type',) + _RUN_VISIBLE_PARAMS.get(run_type, ())
+    return _prune_run_params(params, keep_keys), None
+
+
+def _sanitize_goto_label_params(params):
+    label = str(params.get('label', '')).strip()
+    if not label:
+        return None, "参数 'label' 不能为空"
+    max_jumps = str(params.get('max_jumps', '100')).strip() or '100'
+    return {'label': label, 'max_jumps': max_jumps}, None
+
+
+def _sanitize_loop_start_params(params):
+    mode = params.get('mode', 'fixed')
+    keep_keys = ('mode',) + _LOOP_VISIBLE_PARAMS.get(mode, _LOOP_VISIBLE_PARAMS['fixed'])
+    new_params = _copy_present_params(params, keep_keys)
+
+    required_key, required_error = _LOOP_REQUIRED_PARAMS.get(mode, _LOOP_REQUIRED_PARAMS['fixed'])
+    if not str(new_params.get(required_key, '')).strip():
+        return None, required_error
+    return new_params, None
+
+
+def _sanitize_foreach_line_params(params):
+    source_text = str(params.get('source_text', '')).strip()
+    file_path = str(params.get('file_path', '')).strip()
+    if not source_text and not file_path:
+        return None, "批量处理必须填写数据内容/变量，或填写文本数据文件路径"
+
+    max_lines = str(params.get('max_lines', '10000')).strip() or '10000'
+    try:
+        if int(max_lines) <= 0:
+            return None, "参数 'max_lines' 必须大于 0"
+    except (ValueError, TypeError):
+        return None, "参数 'max_lines' 必须是正整数"
+
+    params['max_lines'] = max_lines
+    params['file_path'] = file_path
+    params['source_text'] = params.get('source_text', '')
+    params['current_line_var'] = str(params.get('current_line_var', 'current_line')).strip() or 'current_line'
+    params['index_var'] = str(params.get('index_var', 'loop_index')).strip() or 'loop_index'
+    params['total_var'] = str(params.get('total_var', 'loop_total')).strip() or 'loop_total'
+    return params, None
+
+
+def _validate_image_params(params):
+    for path_key in ('path', 'condition_image'):
+        if path_key not in params or not params[path_key]:
+            continue
+        image_path = params[path_key]
+        if not os.path.exists(image_path):
+            return f"文件不存在: {image_path}"
+        if not image_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+            return f"文件格式错误 (仅支持图片): {os.path.basename(image_path)}"
+    return None
+
+
 def parse_region_string(region_str):
     if not region_str: return None
     try:
@@ -56,6 +361,23 @@ class AutoWrapLabel(ttk.Label):
 
 
 
+
+
+class MultiLineParamText(tk.Text):
+    def get(self, *args):
+        if not args:
+            return super().get("1.0", "end-1c")
+        return super().get(*args)
+
+    def delete(self, *args):
+        if args and args[0] == 0:
+            return super().delete("1.0", "end")
+        return super().delete(*args)
+
+    def insert(self, index, chars, *args):
+        if index == 0:
+            index = "1.0"
+        return super().insert(index, chars, *args)
 
 # ======================================================================
 # 参数控件工厂类（从 MacroMate.py 迁移）
@@ -101,12 +423,48 @@ class ParamWidgetFactory:
         return token
 
     def create_param_entry(self, parent, key, label_text, default_value):
-        """创建参数输入框"""
+        """Create a single-line parameter entry."""
         frame = ttk.Frame(parent)
         ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor="w")
         entry = ttk.Entry(frame, width=25, font=self.font_ui)
         entry.insert(0, default_value)
         entry.pack(anchor="w", fill=tk.X)
+        entry._param_frame = frame
+        frame.pack(fill=tk.X, pady=8)
+        return entry
+
+    def create_param_text(self, parent, key, label_text, default_value, height=4):
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor="w")
+        text = MultiLineParamText(frame, height=height, wrap="word", font=self.font_ui, relief="solid", borderwidth=1, undo=True)
+        text.insert("1.0", default_value)
+        text.pack(anchor="w", fill=tk.X)
+        text._param_frame = frame
+        frame.pack(fill=tk.X, pady=8)
+        return text
+
+    def create_file_path_entry(self, parent, key, label_text, default_value, mode="open", filetypes=None):
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor="w")
+        input_frame = ttk.Frame(frame)
+        input_frame.pack(fill=tk.X, expand=True)
+        entry = ttk.Entry(input_frame, width=25, font=self.font_ui)
+        entry.insert(0, default_value)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def browse():
+            types = filetypes or [("All", "*.*")]
+            if mode == "save":
+                selected = filedialog.asksaveasfilename(filetypes=types)
+            else:
+                selected = filedialog.askopenfilename(filetypes=types)
+            if selected:
+                entry.delete(0, tk.END)
+                entry.insert(0, selected)
+
+        btn = ttk.Button(input_frame, text="浏览...", width=8, command=browse, bootstyle="info-outline")
+        btn.pack(side=tk.RIGHT, padx=(5, 0))
+        entry._param_frame = frame
         frame.pack(fill=tk.X, pady=8)
         return entry
 
@@ -140,6 +498,7 @@ class ParamWidgetFactory:
         entry = ttk.Entry(frame, width=22, font=self.font_ui)
         entry.insert(0, default_value)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        entry._param_frame = frame
         frame.pack(fill=tk.X, pady=3)
         return entry
 
@@ -292,6 +651,90 @@ class ParamWidgetFactory:
             return os.path.abspath(f)
         return None
 
+    def _add_find_retry_options(self, parent_frame, param_widgets, include_ignore_fail=False):
+        param_widgets['retry_count'] = self.create_param_entry(parent_frame, "retry_count", "失败重试次数:", "0")
+        param_widgets['retry_interval'] = self.create_param_entry(parent_frame, "retry_interval", "重试间隔(秒):", "0.5")
+        if include_ignore_fail:
+            param_widgets['ignore_fail'] = self.create_param_checkbox(parent_frame, "ignore_fail", "[OK] 找不到时继续执行", default=False)
+
+    def _add_text_capture_options(self, parent_frame, param_widgets):
+        param_widgets['save_to_clipboard'] = self.create_param_checkbox(parent_frame, "save_to_clipboard", "[OK] 保存识别结果到剪贴板", default=False)
+        param_widgets['save_to_var'] = self.create_param_entry(parent_frame, "save_to_var", "保存至变量 (可选):", "")
+        sub_frame = ttk.Frame(parent_frame)
+        sub_frame.pack(fill=tk.X)
+        extract_frame = ttk.Frame(sub_frame)
+        ttk.Label(extract_frame, text="提取模式 (正则，可选):", font=self.font_ui).pack(anchor="w")
+        extract_entry = ttk.Entry(extract_frame, width=25, font=self.font_ui)
+        extract_entry.insert(0, r"\d+")
+        extract_entry.pack(anchor="w", fill=tk.X)
+        param_widgets['extract_pattern'] = extract_entry
+        hint = AutoWrapLabel(sub_frame, text="提取模式: 用正则表达式过滤识别结果，如 \\d+ 只提取数字；留空则保存全部文本。", font=self.font_ui, style="secondary.TLabel")
+
+        def toggle(var=param_widgets['save_to_clipboard'], ef=extract_frame, hint_label=hint):
+            if var.get():
+                ef.pack(fill=tk.X, pady=8); hint_label.pack(anchor="w", pady=5, fill=tk.X)
+            else:
+                ef.pack_forget(); hint_label.pack_forget()
+        self._trace_add_for_widget(param_widgets['save_to_clipboard'], 'write', lambda *_: toggle())
+
+
+    def _build_image_find_form(self, action_key, parent_frame, param_widgets, on_select_region,
+                               browse_image_cb, on_test_find_image):
+        is_if_action = action_key == 'IF_IMAGE_FOUND'
+        param_widgets['path'] = self.create_param_entry(parent_frame, "path", "图像路径:", "button.png")
+        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+        confidence_label = "置信度:" if is_if_action else "置信度(0.1-1.0):"
+        param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", confidence_label, "0.8")
+        self._add_find_retry_options(parent_frame, param_widgets, include_ignore_fail=not is_if_action)
+        if not is_if_action:
+            self.create_hint_label(parent_frame, "* 提示：如果识别失败，请调低置信度")
+        self.create_browse_button(parent_frame, browse_image_cb)
+        test_label = "🧪 测试 IF 图像" if is_if_action else "🧪 测试查找图像"
+        self.create_test_button(parent_frame, test_label, on_test_find_image)
+
+    def _build_text_find_form(self, action_key, parent_frame, param_widgets, available_ocr_keys,
+                              on_select_region, on_test_find_text):
+        is_if_action = action_key == 'IF_TEXT_FOUND'
+        label_text = "查找文本:" if is_if_action else "查找的文本:"
+        param_widgets['text'] = self.create_param_entry(parent_frame, "text", label_text, "确定")
+        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+        param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
+        param_widgets['engine'] = self.create_ocr_engine_combobox(parent_frame, available_ocr_keys)
+        self._add_find_retry_options(parent_frame, param_widgets, include_ignore_fail=not is_if_action)
+        self._add_text_capture_options(parent_frame, param_widgets)
+        test_label = "🧪 测试 IF 文本" if is_if_action else "🧪 测试查找文本 (OCR)"
+        self.create_test_button(parent_frame, test_label, on_test_find_text)
+
+    def _build_var_compare_form(self, parent_frame, param_widgets, left_default, right_default,
+                                include_goto_fields=False):
+        param_widgets['var_value'] = self.create_param_entry(parent_frame, "var_value", '比较左侧:', left_default)
+        op_options = ['==', '!=', '>', '<', '>=', '<=', '包含', '不包含']
+        param_widgets['operator'] = self.create_param_combobox(parent_frame, "operator", '操作符:', op_options, default="==")
+        param_widgets['expected_val'] = self.create_param_entry(parent_frame, "expected_val", '比较右侧:', right_default)
+        if include_goto_fields:
+            param_widgets['label'] = self.create_param_entry(parent_frame, "label", '条件成立时跳转至标签:', "Next_Item")
+            param_widgets['max_jumps'] = self.create_param_entry(parent_frame, "max_jumps", '最大跳转次数 (防死循环):', "100")
+
+    def _build_simple_action_form(self, action_key, parent_frame, param_widgets):
+        for field_type, key, label, default, options_factory in _SIMPLE_ACTION_FORM_FIELDS[action_key]:
+            if field_type == 'entry':
+                param_widgets[key] = self.create_param_entry(parent_frame, key, label, default)
+            elif field_type == 'combobox':
+                options = options_factory() if callable(options_factory) else options_factory
+                param_widgets[key] = self.create_param_combobox(parent_frame, key, label, options, default=default)
+            elif field_type == 'checkbox':
+                param_widgets[key] = self.create_param_checkbox(parent_frame, key, label, default=default)
+
+        hint_text = _SIMPLE_ACTION_HINTS.get(action_key)
+        if hint_text:
+            self.create_hint_label(parent_frame, hint_text)
+
+        instruction = _SIMPLE_ACTION_INSTRUCTIONS.get(action_key)
+        if instruction:
+            title, lines = instruction
+            self.create_instruction_panel(parent_frame, title, list(lines))
+
+
     def build_action_form(self, action_key, parent_frame, param_widgets, available_ocr_keys, callbacks):
         """
         构建指定动作类型的参数表单界面
@@ -326,100 +769,29 @@ class ParamWidgetFactory:
                 return "SWITCH_TO_FIND_IMAGE"
 
         if action_key == 'FIND_IMAGE':
-            param_widgets['path'] = self.create_param_entry(parent_frame, "path", "图像路径:", "button.png")
-            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
-            param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", "置信度(0.1-1.0):", "0.8")
-            self.create_hint_label(parent_frame, "* 提示：如果识别失败，请调低置信度")
-            self.create_browse_button(parent_frame, browse_image_cb)
-            self.create_test_button(parent_frame, "🧪 测试查找图像", on_test_find_image)
-            
+            self._build_image_find_form(action_key, parent_frame, param_widgets, on_select_region, browse_image_cb, on_test_find_image)
+
         elif action_key == 'FIND_TEXT':
-            param_widgets['text'] = self.create_param_entry(parent_frame, "text", "查找的文本:", "确定")
-            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
-            param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
-            param_widgets['engine'] = self.create_ocr_engine_combobox(parent_frame, available_ocr_keys)
-            
-            param_widgets['save_to_clipboard'] = self.create_param_checkbox(parent_frame, "save_to_clipboard", "[OK] 保存识别结果到剪贴板", default=False)
-            param_widgets['save_to_var'] = self.create_param_entry(parent_frame, "save_to_var", "保存至变量 (可选):", "")
-            _sub_ft = ttk.Frame(parent_frame)
-            _sub_ft.pack(fill=tk.X)
-            _ep_frame_ft = ttk.Frame(_sub_ft)
-            ttk.Label(_ep_frame_ft, text="提取模式 (正则，可选):", font=self.font_ui).pack(anchor="w")
-            _ep_entry_ft = ttk.Entry(_ep_frame_ft, width=25, font=self.font_ui)
-            _ep_entry_ft.insert(0, r"\d+")
-            _ep_entry_ft.pack(anchor="w", fill=tk.X)
-            param_widgets['extract_pattern'] = _ep_entry_ft
-            _hint_ft = AutoWrapLabel(_sub_ft, text="提取模式: 用正则表达式过滤识别结果，如 \\d+ 只提取数字；留空则保存全部文本。", font=self.font_ui, style="secondary.TLabel")
+            self._build_text_find_form(action_key, parent_frame, param_widgets, available_ocr_keys, on_select_region, on_test_find_text)
 
-            def _toggle_ft(var=param_widgets['save_to_clipboard'], ef=_ep_frame_ft, hint=_hint_ft):
-                if var.get():
-                    ef.pack(fill=tk.X, pady=8); hint.pack(anchor="w", pady=5, fill=tk.X)
-                else:
-                    ef.pack_forget(); hint.pack_forget()
-            self._trace_add_for_widget(param_widgets['save_to_clipboard'], 'write', lambda *_: _toggle_ft())
-            self.create_test_button(parent_frame, "🧪 测试查找文本 (OCR)", on_test_find_text)
-            
-        elif action_key == 'MOVE_OFFSET':
-            param_widgets['x_offset'] = self.create_param_entry(parent_frame, "x_offset", "X 偏移:", "10")
-            param_widgets['y_offset'] = self.create_param_entry(parent_frame, "y_offset", "Y 偏移:", "0")
-            
-        elif action_key == 'CLICK':
-            param_widgets['button'] = self.create_param_combobox(parent_frame, "button", "按键:", list(MacroSchema.CLICK_OPTIONS.keys()))
-        
-        elif action_key == 'SCROLL':
-            param_widgets['amount'] = self.create_param_entry(parent_frame, "amount", "滚动量 (正数=上, 负数=下):", "100")
-            param_widgets['x'] = self.create_param_entry(parent_frame, "x", "X 坐标 (可选):", "")
-            param_widgets['y'] = self.create_param_entry(parent_frame, "y", "Y 坐标 (可选):", "")
-            self.create_hint_label(parent_frame, "* 提示: 如果 X, Y 为空，将在当前鼠标位置滚动。")
+        elif action_key in _SIMPLE_ACTION_FORM_FIELDS:
+            self._build_simple_action_form(action_key, parent_frame, param_widgets)
 
-        elif action_key == 'WAIT':
-            param_widgets['ms'] = self.create_param_entry(parent_frame, "ms", "等待 (毫秒):", "500")
-            
-        elif action_key == 'TYPE_TEXT':
-            param_widgets['text'] = self.create_param_entry(parent_frame, "text", "输入文本:", "你好")
-            self.create_hint_label(parent_frame, "* 此功能使用剪贴板 (Ctrl+V)，以支持中文及复杂文本输入。\n* 支持占位符: {CLIPBOARD} 将替换为剪贴板内容\n* 示例: '订单号: {CLIPBOARD}' → '订单号: 12345'")
-            
-        elif action_key == 'PRESS_KEY':
-            param_widgets['key'] = self.create_param_entry(parent_frame, "key", "按键或组合键 (Enter, Ctrl+C):", "Enter")
-        
         elif action_key == 'AI_COMMAND':
-            param_widgets['instruction'] = self.create_param_entry(parent_frame, "instruction", "AI 指令:", "点击列表里价格最低的那个商品")
+            param_widgets['instruction'] = self.create_param_text(parent_frame, "instruction", "AI 指令:", "点击列表里价格最低的那个商品", height=3)
             param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
             self.create_hint_label(parent_frame, "* 提示: 输入自然语言指令，如 '点击确定按钮'\n* AI 会分析屏幕截图，理解指令并返回坐标\n* 支持: OpenAI, Anthropic, DeepSeek, 智谱, 通义千问等")
             self.create_test_button(parent_frame, "🧪 测试 AI 指令", on_test_ai_command)
         
-        elif action_key == 'ACTIVATE_WINDOW':
-            param_widgets['title'] = self.create_param_entry(parent_frame, "title", "窗口标题 (支持部分匹配):", "记事本")
-            self.create_hint_label(parent_frame, "* 提示: 宏将查找标题中包含此文本的窗口，并将其激活到最前端。")
-        
-        elif action_key == 'NOTE':
-            param_widgets['text'] = self.create_param_entry(parent_frame, "text", "备注内容:", "这里是需要备注的文本...")
-            self.create_hint_label(parent_frame, "* 注意: 此步骤仅作为注释，不会执行任何操作。\n* 备注内容以 LABEL: 或 标签: 开头时，可作为“跳转到标签”的目标。\n* 示例: LABEL: 重试登录")
-
-        elif action_key == 'GOTO_LABEL':
-            param_widgets['label'] = self.create_param_entry(parent_frame, "label", "目标标签名:", "重试登录")
-            param_widgets['max_jumps'] = self.create_param_entry(parent_frame, "max_jumps", "最大跳转次数(安全阀):", "100")
-            self.create_instruction_panel(parent_frame, "使用说明", [
-                "先添加一个“备注”步骤作为标签，例如: LABEL: 重试登录",
-                "本步骤只填写标签名，例如: 重试登录",
-                "标签名必须唯一；重复或找不到都会停止执行",
-                "每个跳转步骤默认最多跳转 100 次，防止死循环",
-                "当前版本不支持在 LOOP 循环内部执行跳转",
-            ])
-
         elif action_key == 'RUN':
-            run_type_options = {'command (命令)': 'command', 'script (脚本)': 'script', 'file (写入文件)': 'file'}
-            param_widgets['run_type'] = self.create_param_combobox(parent_frame, "run_type", "类型:", list(run_type_options.keys()), default='command (命令)')
+            run_type_options = MacroSchema.RUN_TYPE_OPTIONS
+            param_widgets['run_type'] = self.create_param_combobox(parent_frame, "run_type", "类型:", list(run_type_options.keys()), default=MacroSchema.RUN_TYPE_DISPLAY_BY_VALUE.get('command', 'command (命令)'))
             param_widgets['command'] = self.create_param_entry(parent_frame, "command", "命令:", "curl")
-            param_widgets['args'] = self.create_param_entry(parent_frame, "args", "参数:", "")
-            param_widgets['script_path'] = self.create_param_entry(parent_frame, "script_path", "脚本路径:", "process.py")
+            param_widgets['args'] = self.create_param_text(parent_frame, "args", "参数:", "", height=3)
+            param_widgets['script_path'] = self.create_file_path_entry(parent_frame, "script_path", "脚本路径:", "process.py", filetypes=[("Scripts", "*.py *.js *.ps1"), ("All", "*.*")])
             param_widgets['interpreter'] = self.create_param_combobox(parent_frame, "interpreter", "解释器:", ["python", "node", "powershell"], default="python")
-            param_widgets['file_path'] = self.create_param_entry(parent_frame, "file_path", "文件路径:", "result.txt")
-            param_widgets['content'] = self.create_param_entry(parent_frame, "content", "文件内容:", "Hello World")
-            param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
             param_widgets['timeout'] = self.create_param_entry(parent_frame, "timeout", "超时(秒):", "30")
             param_widgets['cwd'] = self.create_param_entry(parent_frame, "cwd", "工作目录:", "")
-            param_widgets['append'] = self.create_param_checkbox(parent_frame, "append", "[OK] 追加模式 (文件)", default=False)
             param_widgets['save_output'] = self.create_param_checkbox(parent_frame, "save_output", "[OK] 保存输出到剪贴板", default=False)
             param_widgets['shell_mode'] = self.create_param_checkbox(parent_frame, "shell_mode", "[警告] shell 模式 (仅可信宏)", default=False)
             param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] RUN 失败时停止宏", default=False)
@@ -439,37 +811,13 @@ class ParamWidgetFactory:
                 mouse_tracker.start()
             
         elif action_key == 'IF_IMAGE_FOUND':
-            param_widgets['path'] = self.create_param_entry(parent_frame, "path", "图像路径:", "button.png")
-            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
-            param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", "置信度:", "0.8")
-            self.create_browse_button(parent_frame, browse_image_cb)
-            self.create_test_button(parent_frame, "🧪 测试 IF 图像", on_test_find_image)
-            
-        elif action_key == 'IF_TEXT_FOUND':
-            param_widgets['text'] = self.create_param_entry(parent_frame, "text", "查找文本:", "确定")
-            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
-            param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
-            param_widgets['engine'] = self.create_ocr_engine_combobox(parent_frame, available_ocr_keys)
-            param_widgets['save_to_clipboard'] = self.create_param_checkbox(parent_frame, "save_to_clipboard", "[OK] 保存识别结果到剪贴板", default=False)
-            param_widgets['save_to_var'] = self.create_param_entry(parent_frame, "save_to_var", "保存至变量 (可选):", "")
-            _sub_ift = ttk.Frame(parent_frame); _sub_ift.pack(fill=tk.X)
-            _ep_frame_ift = ttk.Frame(_sub_ift)
-            ttk.Label(_ep_frame_ift, text="提取模式 (正则，可选):", font=self.font_ui).pack(anchor="w")
-            _ep_entry_ift = ttk.Entry(_ep_frame_ift, width=25, font=self.font_ui); _ep_entry_ift.insert(0, r"\d+"); _ep_entry_ift.pack(anchor="w", fill=tk.X)
-            param_widgets['extract_pattern'] = _ep_entry_ift
-            _hint_ift = AutoWrapLabel(_sub_ift, text="提取模式: 用正则表达式过滤识别结果，如 \\d+ 只提取数字；留空则保存全部文本。", font=self.font_ui, style="secondary.TLabel")
+            self._build_image_find_form(action_key, parent_frame, param_widgets, on_select_region, browse_image_cb, on_test_find_image)
 
-            def _toggle_ift(var=param_widgets['save_to_clipboard'], ef=_ep_frame_ift, hint=_hint_ift):
-                if var.get():
-                    ef.pack(fill=tk.X, pady=8); hint.pack(anchor="w", pady=5, fill=tk.X)
-                else:
-                    ef.pack_forget(); hint.pack_forget()
-            self._trace_add_for_widget(param_widgets['save_to_clipboard'], 'write', lambda *_: _toggle_ift())
-            self.create_test_button(parent_frame, "🧪 测试 IF 文本", on_test_find_text)
-            
+        elif action_key == 'IF_TEXT_FOUND':
+            self._build_text_find_form(action_key, parent_frame, param_widgets, available_ocr_keys, on_select_region, on_test_find_text)
+
         elif action_key == 'LOOP_START':
-            mode_options = {'固定次数': 'fixed', '直到找到图像': 'until_image', '直到找到文本': 'until_text'}
-            param_widgets['mode'] = self.create_param_combobox(parent_frame, "mode", "循环模式:", list(mode_options.keys()), default='固定次数')
+            param_widgets['mode'] = self.create_param_combobox(parent_frame, "mode", '循环模式:', list(LOOP_MODE_OPTIONS.keys()), default=LOOP_MODE_DISPLAY_BY_VALUE.get('fixed', '固定次数'))
             param_widgets['times'] = self.create_param_entry(parent_frame, "times", "循环次数:", "10")
             param_widgets['max_iterations'] = self.create_param_entry(parent_frame, "max_iterations", "最大迭代次数 (安全阀):", "1000")
             param_widgets['condition_image'] = self.create_param_entry(parent_frame, "condition_image", "目标图像路径:", "target.png")
@@ -491,26 +839,21 @@ class ParamWidgetFactory:
         elif action_key == 'END_FOREACH':
             self.create_hint_label(parent_frame, "* 提示: 'END_FOREACH' 标志着批量处理块结束。")
             
-        elif action_key == 'SET_VAR':
-            param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "变量名:", "my_var")
-            param_widgets['var_value'] = self.create_param_entry(parent_frame, "var_value", "变量值:", "123")
-            self.create_hint_label(parent_frame, "* 提示: 变量名无需大括号，变量值支持 {其他变量} 插值。")
-            
         elif action_key == 'READ_FILE':
-            param_widgets['file_path'] = self.create_param_entry(parent_frame, "file_path", "文件路径:", "C:\\test.txt")
+            param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本文件路径:", "C:\\test.txt", filetypes=[("Text", "*.txt *.log *.csv *.json *.jsonl *.md *.xml *.yaml *.yml *.ini *.cfg"), ("All", "*.*")])
             param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "file_content")
             param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
             param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 读取失败时停止宏", default=False)
             
         elif action_key == 'EXTRACT_VAR':
-            param_widgets['source_text'] = self.create_param_entry(parent_frame, "source_text", "源文本:", "{ocr_result}")
+            param_widgets['source_text'] = self.create_param_text(parent_frame, "source_text", "源文本:", "{ocr_result}", height=3)
             param_widgets['regex'] = self.create_param_entry(parent_frame, "regex", "正则表达式:", r"\d+\.\d+")
             param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "price")
             param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 提取失败时停止宏", default=False)
             self.create_hint_label(parent_frame, "* 提示: 使用正则表达式提取，例如 \\d+ 提取纯数字。")
 
         elif action_key == 'JSON_EXTRACT':
-            param_widgets['source_json'] = self.create_param_entry(parent_frame, "source_json", "JSON文本:", "{api_response}")
+            param_widgets['source_json'] = self.create_param_text(parent_frame, "source_json", "JSON文本:", "{api_response}", height=4)
             param_widgets['json_path'] = self.create_param_entry(parent_frame, "json_path", "提取路径:", "data.list[0].price")
             param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "real_price")
             param_widgets['default_value'] = self.create_param_entry(parent_frame, "default_value", "失败默认值(可选):", "")
@@ -526,8 +869,8 @@ class ParamWidgetFactory:
             self.create_hint_label(parent_frame, "* 提示: 这是智点助手主动询问用户，不是识别其他软件或网页弹窗；取消输入会安全停止宏。")
 
         elif action_key == 'FOREACH_LINE':
-            param_widgets['file_path'] = self.create_compact_entry(parent_frame, "file_path", "数据文件:", "")
-            param_widgets['source_text'] = self.create_compact_entry(parent_frame, "source_text", "数据内容:", "{file_content}")
+            param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本数据文件:", "", filetypes=[("Text", "*.txt *.log *.csv *.tsv"), ("All", "*.*")])
+            param_widgets['source_text'] = self.create_param_text(parent_frame, "source_text", "数据内容:", "{file_content}", height=3)
             param_widgets['current_line_var'] = self.create_compact_entry(parent_frame, "current_line_var", "当前行变量:", "current_line")
             param_widgets['split_delimiter'] = self.create_compact_entry(parent_frame, "split_delimiter", "分隔符:", ",")
             param_widgets['field_names'] = self.create_compact_entry(parent_frame, "field_names", "字段变量:", "account,password")
@@ -535,45 +878,31 @@ class ParamWidgetFactory:
             self.create_hint_label(parent_frame, "* 每次取一行执行后续步骤；拆分后可直接使用 {account}、{password}。")
 
             advanced_frame = self.create_collapsible_frame(parent_frame, "高级选项", expanded=False)
-            param_widgets['encoding'] = self.create_compact_combobox(advanced_frame, "encoding", "文件编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
+            param_widgets['encoding'] = self.create_compact_combobox(advanced_frame, "encoding", "文本编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
             param_widgets['index_var'] = self.create_compact_entry(advanced_frame, "index_var", "序号变量:", "loop_index")
             param_widgets['total_var'] = self.create_compact_entry(advanced_frame, "total_var", "总数变量:", "loop_total")
             param_widgets['max_lines'] = self.create_compact_entry(advanced_frame, "max_lines", "最大行数:", "10000")
             param_widgets['strip_fields'] = self.create_param_checkbox(advanced_frame, "strip_fields", "[OK] 去掉字段前后空格", default=True)
              
         elif action_key == 'IF_VAR':
-            param_widgets['var_value'] = self.create_param_entry(parent_frame, "var_value", "比较左侧:", "{price}")
-            op_options = ['==', '!=', '>', '<', '>=', '<=', '包含', '不包含']
-            param_widgets['operator'] = self.create_param_combobox(parent_frame, "operator", "操作符:", op_options, default="==")
-            param_widgets['expected_val'] = self.create_param_entry(parent_frame, "expected_val", "比较右侧:", "100")
+            self._build_var_compare_form(parent_frame, param_widgets, "{price}", "100")
 
-        elif action_key == 'CALCULATE':
-            param_widgets['expression'] = self.create_param_entry(parent_frame, "expression", "变量计算表达式:", "({price} * 1.5) + 10")
-            param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "final_price")
-            param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 计算失败时停止宏", default=False)
-            self.create_hint_label(parent_frame, "* 提示: 用来把已识别或读取到的变量做加减乘除，例如价格、数量、序号；不适合当作普通计算器使用。")
-            
         elif action_key == 'WRITE_FILE':
-            param_widgets['file_path'] = self.create_param_entry(parent_frame, "file_path", "文件路径:", "C:\\log.txt")
-            param_widgets['content'] = self.create_param_entry(parent_frame, "content", "写入内容:", "{date} - {result}")
+            param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本文件路径:", "C:\\log.txt", mode="save", filetypes=[("Text", "*.txt *.log *.csv *.json *.jsonl *.md *.xml *.yaml *.yml *.ini *.cfg"), ("All", "*.*")])
+            param_widgets['content'] = self.create_param_text(parent_frame, "content", "写入文本:", "{date} - {result}", height=4)
             param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
-            param_widgets['append'] = self.create_param_checkbox(parent_frame, "append", "[OK] 追加模式 (不覆盖原文件)", default=True)
+            param_widgets['append'] = self.create_param_checkbox(parent_frame, "append", "[OK] 追加模式 (不覆盖原文本文件)", default=True)
             param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 写入失败时停止宏", default=False)
             
         elif action_key == 'GOTO_IF':
-            param_widgets['var_value'] = self.create_param_entry(parent_frame, "var_value", "比较左侧:", "{status}")
-            op_options = ['==', '!=', '>', '<', '>=', '<=', '包含', '不包含']
-            param_widgets['operator'] = self.create_param_combobox(parent_frame, "operator", "操作符:", op_options, default="==")
-            param_widgets['expected_val'] = self.create_param_entry(parent_frame, "expected_val", "比较右侧:", "缺货")
-            param_widgets['label'] = self.create_param_entry(parent_frame, "label", "条件成立时跳转至标签:", "Next_Item")
-            param_widgets['max_jumps'] = self.create_param_entry(parent_frame, "max_jumps", "最大跳转次数 (防死循环):", "100")
+            self._build_var_compare_form(parent_frame, param_widgets, "{status}", '缺货', include_goto_fields=True)
 
         return None
 
     def collect_step_data(self, action_key, param_widgets, engine_key_map=None):
         """
         从参数控件中收集并校验数据
-        
+
         Returns:
             params: 整理后的参数字典
             error: 错误消息，若无错误则为 None
@@ -581,313 +910,126 @@ class ParamWidgetFactory:
         params = {}
         try:
             for k, w in param_widgets.items():
-                # 处理 BooleanVar (复选框)
                 if isinstance(w, tk.BooleanVar):
                     params[k] = w.get()
                     continue
-                
+
                 val = w.get()
-                
-                # 数字校验
-                if k in ['x', 'y', 'ms', 'times', 'x_offset', 'y_offset', 'amount', 'max_iterations', 'max_jumps', 'max_lines', 'timeout']:
-                    if val:
-                        if k in ('ms', 'times', 'max_iterations', 'max_jumps', 'max_lines'):
-                            try:
-                                parsed_int = int(val.strip())
-                            except (ValueError, TypeError):
-                                return None, f"参数 '{k}' 必须是非负整数"
-                            if parsed_int < 0:
-                                return None, f"参数 '{k}' 必须是非负整数"
-                            if k in ('max_iterations', 'max_jumps', 'max_lines') and parsed_int <= 0:
-                                return None, f"参数 '{k}' 必须大于 0"
-                        elif k == 'timeout':
-                            # [P2修复] timeout 要求正整数，≤0 无意义
-                            try:
-                                parsed_timeout = int(val.strip())
-                            except (ValueError, TypeError):
-                                return None, "参数 'timeout' 必须是正整数（如 30）"
-                            if parsed_timeout <= 0:
-                                return None, "参数 'timeout' 必须大于 0"
-                        else:
-                            try:
-                                int(val.strip())
-                            except (ValueError, TypeError):
-                                return None, f"参数 '{k}' 必须是整数"
-                
-                # confidence 浮点校验
-                if k == 'confidence' and val:
-                    try:
-                        cf = float(val.strip())
-                        if not (0.0 < cf <= 1.0):
-                            return None, "参数 'confidence' 必须在 0.0 ~ 1.0 之间"
-                    except (ValueError, TypeError):
-                        return None, "参数 'confidence' 必须是数字（如 0.8）"
 
-                
-                if action_key == 'SCROLL' and k in ['x', 'y'] and not val:
-                    continue
-                
+                error = _validate_numeric_param(k, val)
+                if error:
+                    return None, error
+
+                if k == 'confidence':
+                    error = _validate_confidence(val)
+                    if error:
+                        return None, error
+
+                if k == 'retry_interval':
+                    error = _validate_retry_interval(val)
+                    if error:
+                        return None, error
+
                 if not val:
-                    if k in ('region', 'extract_pattern', 'save_to_var'): pass
-                    elif action_key == 'SET_VAR' and k == 'var_value': pass
-                    elif action_key == 'WRITE_FILE' and k in ('content', 'append'): pass
-                    elif action_key in ('JSON_EXTRACT', 'PROMPT_INPUT') and k == 'default_value': pass
-                    elif action_key == 'JSON_EXTRACT' and k == 'json_path': pass
-                    elif action_key == 'FOREACH_LINE' and k in ('file_path', 'source_text', 'split_delimiter', 'field_names'): pass
-                    elif action_key in ('IF_VAR', 'GOTO_IF') and k in ('var_value', 'expected_val'): pass
-                    elif action_key in ('ELSE', 'END_IF', 'END_LOOP', 'END_FOREACH', 'NOTE'): continue
-                    elif action_key in ('SCROLL', 'CLICK') and k in ('x', 'y'): continue
-                    elif action_key == 'RUN': continue
-                    else: return None, f"参数 '{k}' 不能为空"
-                
-                # 参数转换
-                if k == 'mode':
-                    params[k] = {'固定次数': 'fixed', '直到找到图像': 'until_image', '直到找到文本': 'until_text'}.get(val, 'fixed')
-                elif k == 'run_type':
-                    params[k] = {'command (命令)': 'command', 'script (脚本)': 'script', 'file (写入文件)': 'file'}.get(val, 'command')
-                elif k == 'lang':
-                    params[k] = MacroSchema.LANG_OPTIONS.get(val, 'eng')
-                elif k == 'button':
-                    params[k] = MacroSchema.CLICK_OPTIONS.get(val, 'left')
-                elif k == 'engine':
-                    if engine_key_map:
-                        params[k] = engine_key_map.get(val, 'auto')
-                    else:
-                        params[k] = val.split(' ')[0] 
-                elif k == 'region':
-                    if val.strip():
-                        coords = parse_region_string(val)
-                        if not coords:
-                            return None, "参数 'region' 格式无效，应为 x1, y1, x2, y2"
-                        if coords[2] <= coords[0] or coords[3] <= coords[1]:
-                            return None, "参数 'region' 必须满足 x2 > x1 且 y2 > y1"
-                        params['region'] = coords
-                elif k == 'extract_pattern':
-                    if val and val.strip(): params[k] = val.strip()
-                else:
-                    params[k] = val
+                    if action_key in _EMPTY_SKIP_ACTIONS:
+                        continue
+                    if not _is_optional_empty_param(action_key, k):
+                        return None, f"参数 '{k}' 不能为空"
 
-            # RUN 动作参数清洗
+                converted_value, error, include_param = _convert_param_value(k, val, engine_key_map)
+                if error:
+                    return None, error
+                if include_param:
+                    params[k] = converted_value
+
             if action_key == 'RUN':
-                run_type = params.get('run_type', 'command')
-                if run_type == 'command' and not params.get('command'): return None, "RUN 命令类型必须填写 '命令'"
-                elif run_type == 'script' and not params.get('script_path'): return None, "RUN 脚本类型必须填写 '脚本路径'"
-                elif run_type == 'file' and not params.get('file_path'): return None, "RUN 文件类型必须填写 '文件路径'"
-
-                common_keys = ['run_type', 'timeout', 'cwd', 'save_output', 'fail_stop']
-                keep_keys = common_keys + (['command', 'args', 'shell_mode'] if run_type == 'command' else 
-                                         (['script_path', 'interpreter', 'args'] if run_type == 'script' else 
-                                          ['file_path', 'content', 'append', 'encoding']))
-                
-                new_params = {}
-                for k in keep_keys:
-                    if k in params:
-                        v = params[k]
-                        if k == 'timeout' and v == '30': continue
-                        if k == 'interpreter' and v == 'python': continue
-                        if k == 'append' and not v: continue
-                        if k == 'save_output' and not v: continue
-                        if k == 'shell_mode' and not v: continue
-                        if k == 'fail_stop' and not v: continue
-                        if k == 'encoding' and v == 'utf-8': continue
-                        if v is not None and (isinstance(v, bool) or str(v).strip()):
-                            new_params[k] = v
-                params = new_params
+                params, error = _sanitize_run_params(params)
+                if error:
+                    return None, error
 
             if action_key == 'GOTO_LABEL':
-                label = str(params.get('label', '')).strip()
-                if not label:
-                    return None, "参数 'label' 不能为空"
-                max_jumps = str(params.get('max_jumps', '100')).strip() or '100'
-                params = {'label': label, 'max_jumps': max_jumps}
+                params, error = _sanitize_goto_label_params(params)
+                if error:
+                    return None, error
 
-            # LOOP_START 动作参数清洗
             if action_key == 'LOOP_START':
-                mode = params.get('mode', 'fixed')
-
-                if mode == 'fixed':
-                    keep_keys = ['mode', 'times']
-                elif mode == 'until_image':
-                    keep_keys = ['mode', 'condition_image', 'confidence', 'max_iterations', 'region']
-                elif mode == 'until_text':
-                    keep_keys = ['mode', 'condition_text', 'lang', 'max_iterations', 'region']
-                else:
-                    keep_keys = ['mode', 'times']
-
-                new_params = {}
-                for k in keep_keys:
-                    if k in params:
-                        new_params[k] = params[k]
-
-                # 基础必填校验（按模式）
-                if mode == 'fixed' and not str(new_params.get('times', '')).strip():
-                    return None, "参数 'times' 不能为空"
-                if mode == 'until_image' and not str(new_params.get('condition_image', '')).strip():
-                    return None, "参数 'condition_image' 不能为空"
-                if mode == 'until_text' and not str(new_params.get('condition_text', '')).strip():
-                    return None, "参数 'condition_text' 不能为空"
-
-                params = new_params
+                params, error = _sanitize_loop_start_params(params)
+                if error:
+                    return None, error
 
             if action_key == 'FOREACH_LINE':
-                source_text = str(params.get('source_text', '')).strip()
-                file_path = str(params.get('file_path', '')).strip()
-                if not source_text and not file_path:
-                    return None, "批量处理必须填写数据内容/变量，或填写数据文件路径"
-                max_lines = str(params.get('max_lines', '10000')).strip() or '10000'
-                try:
-                    if int(max_lines) <= 0:
-                        return None, "参数 'max_lines' 必须大于 0"
-                except (ValueError, TypeError):
-                    return None, "参数 'max_lines' 必须是正整数"
-                params['max_lines'] = max_lines
-                params['file_path'] = file_path
-                params['source_text'] = params.get('source_text', '')
-                params['current_line_var'] = str(params.get('current_line_var', 'current_line')).strip() or 'current_line'
-                params['index_var'] = str(params.get('index_var', 'loop_index')).strip() or 'loop_index'
-                params['total_var'] = str(params.get('total_var', 'loop_total')).strip() or 'loop_total'
+                params, error = _sanitize_foreach_line_params(params)
+                if error:
+                    return None, error
 
-            # 路径有效性校验
-            for path_key in ['path', 'condition_image']:
-                if path_key in params and params[path_key]:
-                    p = params[path_key]
-                    if not os.path.exists(p): return None, f"文件不存在: {p}"
-                    if not p.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                        return None, f"文件格式错误 (仅支持图片): {os.path.basename(p)}"
+            error = _validate_image_params(params)
+            if error:
+                return None, error
 
             return params, None
         except Exception as e:
             return None, str(e)
 
 
-
 # ======================================================================
 # 参数动态显示控制函数（从 MacroMate.py 迁移）
 # ======================================================================
 def update_loop_params(param_widgets, param_frame, mode_widget):
-    """
-    根据循环模式动态显示/隐藏参数
-
-    Args:
-        param_widgets: 参数字典 {key: widget}
-        param_frame: 参数面板容器
-        mode_widget: 模式选择下拉框
-    """
+    """Show or hide loop parameters by mode."""
     if 'mode' not in param_widgets:
         return
 
-    mode_map = {
-        '固定次数': 'fixed',
-        '直到找到图像': 'until_image',
-        '直到找到文本': 'until_text'
-    }
+    mode = LOOP_MODE_OPTIONS.get(mode_widget.get(), 'fixed')
+    _set_param_visibility(
+        param_widgets,
+        param_frame,
+        _LOOP_PARAM_KEYS,
+        _LOOP_VISIBLE_PARAMS.get(mode, ()),
+    )
 
-    selected_mode = mode_widget.get()
-    mode = mode_map.get(selected_mode, 'fixed')
+def _get_widget_frame(widget):
+    """Return the outer frame used to show or hide a parameter widget."""
+    frame = getattr(widget, '_param_frame', None)
+    if frame is not None:
+        return frame
+    if isinstance(widget, tk.BooleanVar):
+        return None
+    return widget.master
 
-    # 收集提示标签
-    hint_labels = []
-    for widget in param_frame.winfo_children():
-        if isinstance(widget, AutoWrapLabel) or getattr(widget, '_is_instruction_panel', False):
-            hint_labels.append(widget)
+def _collect_instruction_widgets(param_frame):
+    return [
+        widget for widget in param_frame.winfo_children()
+        if isinstance(widget, AutoWrapLabel) or getattr(widget, '_is_instruction_panel', False)
+    ]
 
-    # 隐藏所有条件参数
-    for key in ['times', 'condition_image', 'confidence', 'condition_text', 'lang', 'max_iterations', 'region']:
+
+def _set_param_visibility(param_widgets, param_frame, all_keys, visible_keys):
+    instruction_widgets = _collect_instruction_widgets(param_frame)
+
+    for key in all_keys:
         if key in param_widgets:
             parent_frame = _get_widget_frame(param_widgets[key])
             if parent_frame:
                 parent_frame.pack_forget()
 
-    # 根据模式显示对应参数
-    params_to_show = []
-    if mode == 'fixed':
-        params_to_show = ['times']
-    elif mode == 'until_image':
-        params_to_show = ['condition_image', 'confidence', 'max_iterations', 'region']
-    elif mode == 'until_text':
-        params_to_show = ['condition_text', 'lang', 'max_iterations', 'region']
-
-    # 显示参数
-    for key in params_to_show:
+    for key in visible_keys:
         if key in param_widgets:
             frame = _get_widget_frame(param_widgets[key])
             if frame:
                 frame.pack(fill=tk.X, pady=8)
 
-    # 确保提示标签始终在最后
-    for hint_label in hint_labels:
-        hint_label.pack_forget()
-        hint_label.pack(anchor="w", pady=(10, 6), fill=tk.X)
-
-
-def _get_widget_frame(widget):
-    """获取控件的父容器 frame，兼容 BooleanVar 和普通 tk Widget"""
-    if isinstance(widget, tk.BooleanVar):
-        return getattr(widget, '_param_frame', None)
-    return widget.master
+    for instruction_widget in instruction_widgets:
+        instruction_widget.pack_forget()
+        instruction_widget.pack(anchor="w", pady=(10, 6), fill=tk.X)
 
 
 def update_run_params(param_widgets, param_frame, run_type_widget):
-    """
-    根据 RUN 类型动态显示/隐藏参数
-
-    Args:
-        param_widgets: 参数字典 {key: widget}
-        param_frame: 参数面板容器
-        run_type_widget: 类型选择下拉框
-    """
+    """Show or hide RUN parameters by type."""
     if 'run_type' not in param_widgets:
         return
 
-    run_type_map = {
-        'command (命令)': 'command',
-        'script (脚本)': 'script',
-        'file (写入文件)': 'file'
-    }
-
-    selected_type = run_type_widget.get()
-    run_type = run_type_map.get(selected_type, 'command')
-
-    # 收集提示标签
-    hint_labels = []
-    for widget in param_frame.winfo_children():
-        if isinstance(widget, AutoWrapLabel) or getattr(widget, '_is_instruction_panel', False):
-            hint_labels.append(widget)
-
-    # 各类型对应的参数。除了 run_type，本函数统一接管 RUN 的字段可见性。
-    command_params = ['command', 'args', 'timeout', 'cwd', 'save_output', 'shell_mode', 'fail_stop']
-    script_params = ['script_path', 'interpreter', 'args', 'timeout', 'cwd', 'save_output', 'fail_stop']
-    file_params = ['file_path', 'content', 'append', 'encoding']
-
-    # 隐藏所有 RUN 参数，避免编辑已有步骤时把命令/脚本/文件字段全部展开。
-    all_type_params = sorted(set(command_params + script_params + file_params))
-    for key in all_type_params:
-        if key in param_widgets:
-            parent_frame = _get_widget_frame(param_widgets[key])
-            if parent_frame:
-                parent_frame.pack_forget()
-
-    # 显示选中类型的参数
-    if run_type == 'command':
-        params_to_show = command_params
-    elif run_type == 'script':
-        params_to_show = script_params
-    elif run_type == 'file':
-        params_to_show = file_params
-    else:
-        params_to_show = []
-
-    for key in params_to_show:
-        if key in param_widgets:
-            frame = _get_widget_frame(param_widgets[key])
-            if frame:
-                frame.pack(fill=tk.X, pady=8)
-
-    # 确保提示标签始终在最后
-    for hint_label in hint_labels:
-        hint_label.pack_forget()
-        hint_label.pack(anchor="w", pady=(10, 6), fill=tk.X)
-
+    run_type = MacroSchema.RUN_TYPE_OPTIONS.get(run_type_widget.get(), 'command')
+    _set_param_visibility(param_widgets, param_frame, _RUN_PARAM_KEYS, _RUN_VISIBLE_PARAMS.get(run_type, ()))
 
 # ======================================================================
 # 参数转换工具函数（从 MacroMate.py 迁移）

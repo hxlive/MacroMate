@@ -1,6 +1,6 @@
 # sys_utils.py
 # 描述: 系统底层工具、全局热键管理及稳定工具类集
-# 版本: 1.8.0
+# 版本: 1.8.1
 
 import sys
 import os
@@ -8,13 +8,14 @@ import threading
 import functools
 import base64
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 import pyautogui
-from PIL import Image, ImageTk, ImageGrab
+import ctypes
+from PIL import Image, ImageTk
 from pynput import keyboard
 
 # 引入核心库中的工具
-from core_engine import HotkeyUtils, MacroSchema
+from core_engine import HotkeyUtils
 
 # ======================================================================
 # 1. 系统底层初始化 (DPI, 流, AppID)
@@ -42,13 +43,11 @@ def init_system_runtime():
             
         # 2. 强制启用 DPI 感知 (解决 125%/150% 缩放下的坐标偏移)
         try:
-            import ctypes
             # 设置 DPI 感知级别为 "PerMonitorV2" (Awareness 2)
-            ctypes.windll.shcore.SetProcessDpiAwareness(2) 
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             try:
                 # 回退旧版 API (兼容 Win7/8)
-                import ctypes
                 ctypes.windll.user32.SetProcessDPIAware()
             except Exception:
                 pass
@@ -57,7 +56,6 @@ def set_windows_app_id(app_version):
     """设置 Windows AppUserModelID 以确保任务栏图标显示正确"""
     if sys.platform == 'win32':
         try:
-            import ctypes
             myappid = f'hxlive.macromate.{app_version}'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
             return True
@@ -69,17 +67,24 @@ def set_windows_app_id(app_version):
 # 2. 快捷键冲突检测支持
 # ======================================================================
 HOTKEY_CHECK_AVAILABLE = False
+_WIN_MODIFIER_VK_MAP = {
+    'ctrl': (0x11,),       # VK_CONTROL
+    'alt': (0x12,),        # VK_MENU
+    'shift': (0x10,),      # VK_SHIFT
+    'cmd': (0x5B, 0x5C),   # VK_LWIN, VK_RWIN
+}
 if sys.platform == 'win32':
-    try:
-        import ctypes
-        import ctypes.wintypes
-        HOTKEY_CHECK_AVAILABLE = True
-    except Exception:
-        pass
+    HOTKEY_CHECK_AVAILABLE = True
 
 # ======================================================================
 # 3. 鼠标位置追踪器 (MouseTracker)
 # ======================================================================
+def _center_child_window(parent, dialog):
+    dialog.update_idletasks()
+    x = parent.winfo_x() + (parent.winfo_width() - dialog.winfo_width()) // 2
+    y = parent.winfo_y() + (parent.winfo_height() - dialog.winfo_height()) // 2
+    dialog.geometry(f"+{x}+{y}")
+
 class MouseTracker:
     def __init__(self, root, tk_var):
         self.root = root
@@ -139,7 +144,6 @@ class RegionSelector:
         h = self.master.winfo_screenheight()
         if sys.platform == 'win32':
             try:
-                import ctypes
                 SM_XVIRTUALSCREEN = 76
                 SM_YVIRTUALSCREEN = 77
                 SM_CXVIRTUALSCREEN = 78
@@ -232,6 +236,7 @@ class GlobalHotkeyManager:
         self.held_keys = {}
         self.listener = None
         self._listener_lock = threading.RLock()
+        self._listener_generation = 0
         
     def start_listener(self):
         """Start or restart the global hotkey listener."""
@@ -246,6 +251,8 @@ class GlobalHotkeyManager:
             stop_cache = ""
 
         with self._listener_lock:
+            self._listener_generation += 1
+            generation = self._listener_generation
             self.run_hotkey_cache = run_cache
             self.stop_hotkey_cache = stop_cache
             old_listener = self.listener
@@ -258,12 +265,17 @@ class GlobalHotkeyManager:
             if self.listener is old_listener:
                 self.listener = None
             self.held_keys.clear()
-            threading.Thread(target=self._listener_thread, daemon=True).start()
+            threading.Thread(target=self._listener_thread, args=(generation,), daemon=True).start()
         
-    def _listener_thread(self):
+    def _listener_thread(self, generation):
         try:
-            listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
+            listener = keyboard.Listener(
+                on_press=lambda key: self.on_press(key, generation),
+                on_release=lambda key: self.on_release(key, generation),
+            )
             with self._listener_lock:
+                if generation != self._listener_generation:
+                    return
                 self.listener = listener
             listener.start()
             listener.join()
@@ -282,7 +294,8 @@ class GlobalHotkeyManager:
             if hasattr(key, 'char') and key.char:
                 return key.char.lower()
             return str(key).lower()
-        except: return None
+        except Exception:
+            return None
 
     def _normalize_key(self, key_name):
         if key_name in ('ctrl_l', 'ctrl_r'): return 'ctrl'
@@ -294,14 +307,7 @@ class GlobalHotkeyManager:
     def _modifiers_satisfied(self, required_mods):
         if sys.platform == 'win32':
             try:
-                import ctypes
-                vk_map = {
-                    'ctrl': [0x11],        # VK_CONTROL
-                    'alt': [0x12],         # VK_MENU
-                    'shift': [0x10],       # VK_SHIFT
-                    'cmd': [0x5B, 0x5C]    # VK_LWIN, VK_RWIN
-                }
-                for mod, vks in vk_map.items():
+                for mod, vks in _WIN_MODIFIER_VK_MAP.items():
                     is_pressed = False
                     for vk in vks:
                         if (ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000) != 0:
@@ -316,8 +322,10 @@ class GlobalHotkeyManager:
                 print(f"[Hotkey] check physical keys failed: {e}")
         return all(self.held_keys.get(m, 0) > 0 for m in required_mods)
 
-    def on_press(self, key):
+    def on_press(self, key, generation=None):
         try:
+            if generation is not None and generation != self._listener_generation:
+                return
             key_name = self._normalize_key(self._get_key_name(key))
             if not key_name: return
             
@@ -336,8 +344,10 @@ class GlobalHotkeyManager:
         except Exception as e:
             print(f"[Hotkey] press error: {e}")
 
-    def on_release(self, key):
+    def on_release(self, key, generation=None):
         try:
+            if generation is not None and generation != self._listener_generation:
+                return
             key_name = self._normalize_key(self._get_key_name(key))
             if not key_name: return
             # [优化] 松开按键时直接清空字典中该键的状态，根治所有残留假死
@@ -376,7 +386,6 @@ class GlobalHotkeyManager:
                 if part in HotkeyUtils.PYNPUT_MOD_TO_WIN_MOD: modifiers |= HotkeyUtils.PYNPUT_MOD_TO_WIN_MOD[part]
                 elif part in HotkeyUtils.PYNPUT_TO_VK: vk = HotkeyUtils.PYNPUT_TO_VK[part]
             if vk is None: return True
-            import ctypes
             if ctypes.windll.user32.RegisterHotKey(None, hotkey_id, modifiers, vk) == 0: return False
             ctypes.windll.user32.UnregisterHotKey(None, hotkey_id)
             return True
@@ -407,7 +416,6 @@ class HotkeyEntry(ttk.Entry):
     def _disable_ime(self):
         """调用 Windows API 禁用当前组件的输入法上下文"""
         try:
-            import ctypes
             hwnd = self.winfo_id()
             ctypes.windll.imm32.ImmAssociateContext(hwnd, 0)
         except Exception:
@@ -536,10 +544,8 @@ class HotkeySettingsDialog:
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
-        self.dialog.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - self.dialog.winfo_width()) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - self.dialog.winfo_height()) // 2
-        self.dialog.geometry(f"+{x}+{y}")
+        _center_child_window(parent, self.dialog)
+        self.dialog.deiconify()  # 位置确定后再显示
         self.dialog.deiconify()  # 位置确定后再显示
 
         self._create_ui(run_hotkey, stop_hotkey)
@@ -661,10 +667,8 @@ class VLMSettingsDialog:
         self.dialog.resizable(False, False)
         self.dialog.transient(parent)
         self.dialog.grab_set()
-        self.dialog.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - self.dialog.winfo_width()) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - self.dialog.winfo_height()) // 2
-        self.dialog.geometry(f"+{x}+{y}")
+        _center_child_window(parent, self.dialog)
+        self.dialog.deiconify()  # 位置确定后再显示
         self.dialog.deiconify()  # 位置确定后再显示
 
         self._create_ui()
@@ -926,22 +930,19 @@ class MiniStatusWindow:
         window_width = 500
         window_height = 35
         px, py = self.window.winfo_pointerxy()
-        screen_width = self.window.winfo_screenwidth()
         screen_height = self.window.winfo_screenheight()
         monitor_x = self.window.winfo_vrootx()
         monitor_y = self.window.winfo_vrooty()
-        monitor_w = self.window.winfo_vrootwidth() or screen_width
         monitor_h = self.window.winfo_vrootheight() or screen_height
         if sys.platform == 'win32':
             try:
-                import ctypes
                 user32 = ctypes.windll.user32
                 vx = user32.GetSystemMetrics(76)
                 vy = user32.GetSystemMetrics(77)
                 vw = user32.GetSystemMetrics(78)
                 vh = user32.GetSystemMetrics(79)
                 if vw > 0 and vh > 0 and vx <= px < vx + vw and vy <= py < vy + vh:
-                    monitor_x, monitor_y, monitor_w, monitor_h = vx, vy, vw, vh
+                    monitor_x, monitor_y, monitor_h = vx, vy, vh
             except Exception:
                 pass
         x = monitor_x + 10
@@ -1011,16 +1012,7 @@ class AboutDialog:
                 print(f"[警告] 设置关于对话框图标失败: {e}")
                 
         # 居中显示
-        self.dialog.update_idletasks()
-        main_x = parent.winfo_x()
-        main_y = parent.winfo_y()
-        main_width = parent.winfo_width()
-        main_height = parent.winfo_height()
-        dialog_width = self.dialog.winfo_width()
-        dialog_height = self.dialog.winfo_height()
-        x = main_x + (main_width - dialog_width) // 2
-        y = main_y + (main_height - dialog_height) // 2
-        self.dialog.geometry(f"+{x}+{y}")
+        _center_child_window(parent, self.dialog)
         self.dialog.deiconify()  # 位置确定后再显示
 
         self._create_ui(app_version, icon_path)
@@ -1101,6 +1093,3 @@ class AboutDialog:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(button_frame, text="确  定", command=self.dialog.destroy, bootstyle="primary", width=18, padding=(15, 8)).pack(anchor="center")
-
-
-

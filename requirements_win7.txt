@@ -1,5 +1,5 @@
 pillow>=9.5.0,<11.0.0
-opencv-python>=4.6.0.66,<4.11.0
+opencv-python-headless>=4.6.0.66,<4.11.0
 numpy>=1.21.6,<2.0.0
 PyAutoGUI>=0.9.54
 pygetwindow>=0.0.9

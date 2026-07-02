@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # MacroMate.py
 # 描述: 自动化宏的 GUI 界面
-# 版本: 1.8.0
+# Version: 1.8.1
 
 
 # 使用: 
@@ -38,17 +38,21 @@ import queue
 import ctypes
 ctypes.pythonapi.PyThreadState_SetAsyncExc.argtypes = [ctypes.c_ulong, ctypes.py_object]
 ctypes.pythonapi.PyThreadState_SetAsyncExc.restype = ctypes.c_int
-from PIL import Image, ImageGrab, ImageTk
-import webbrowser
 
 
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 APP_TITLE = f"智点助手 (MacroMate) v{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+def _get_program_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = _get_program_dir()
 CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.json")
 MAX_RECENT_FILES = 5
 
@@ -75,14 +79,13 @@ try:
     import gui_utils
     
     from sys_utils import (
-        init_system_runtime, set_windows_app_id, 
         GlobalHotkeyManager, MouseTracker, RegionSelector, 
         HotkeySettingsDialog, VLMSettingsDialog, ImageTooltipManager, MiniStatusWindow,
         AboutDialog
     )
     from gui_utils import (
-        ParamWidgetFactory, parse_region_string, resource_path, get_icon_path,
-        update_loop_params, update_run_params, param_display_to_internal, param_internal_to_display
+        ParamWidgetFactory, parse_region_string, get_icon_path,
+        update_loop_params, update_run_params, param_internal_to_display
     )
     from core_engine import HotkeyUtils, MacroSchema, validate_macro_data, MacroPersistence
 except ImportError as e:
@@ -116,24 +119,76 @@ def _parse_optional_test_region(region_value):
     return region_box
 
 
+
+
+def _preview_goto_label(p):
+    label = p.get('label', '')
+    max_jumps = p.get('max_jumps', 100)
+    return f"-> {label}  [最多 {max_jumps} 次]"
+
+
+def _preview_json_extract(p):
+    suffix = "；失败用默认值" if p.get('use_default') or str(p.get('default_value', '')) != '' else ""
+    return f"JSON 路径 '{p.get('json_path', '') or '$'}' -> 变量 {p.get('var_name', '')}{suffix}"
+
+
+def _preview_foreach_line(p):
+    source = p.get('file_path') or p.get('source_text', '')
+    line_var = p.get('current_line_var', 'current_line')
+    fields = p.get('field_names', '')
+    suffix = f"；拆分为 {fields}" if fields else ""
+    return f"批量处理文本行 '{source}' -> {{{line_var}}}{suffix}"
+
+
+_STEP_PARAM_PREVIEW_FORMATTERS = {
+    'GOTO_LABEL': _preview_goto_label,
+    'SET_VAR': lambda p: f"变量 {p.get('var_name', '')} = '{p.get('var_value', '')}'",
+    'READ_FILE': lambda p: f"读取文本 '{p.get('file_path', '')}' -> 变量 {p.get('var_name', '')}",
+    'EXTRACT_VAR': lambda p: f"'{p.get('source_text', '')}' 提取 '{p.get('regex', '')}' -> 变量 {p.get('var_name', '')}",
+    'JSON_EXTRACT': _preview_json_extract,
+    'PROMPT_INPUT': lambda p: f"人工输入 '{p.get('prompt', '')}' -> 变量 {p.get('var_name', '')}",
+    'FOREACH_LINE': _preview_foreach_line,
+    'END_FOREACH': lambda _p: '结束批量处理',
+    'IF_VAR': lambda p: f"如果 '{p.get('var_value', '')}' {p.get('operator', '==')} '{p.get('expected_val', '')}'",
+    'CALCULATE': lambda p: f"变量计算 '{p.get('expression', '')}' -> 变量 {p.get('var_name', '')}",
+    'WRITE_FILE': lambda p: f"写入文本至 '{p.get('file_path', '')}'",
+    'GOTO_IF': lambda p: f"如果 '{p.get('var_value', '')}' {p.get('operator', '==')} '{p.get('expected_val', '')}' -> 跳转至 {p.get('label', '')}",
+}
+_LIST_DEDENT_ACTIONS = {'ELSE', 'END_IF', 'END_LOOP', 'END_FOREACH'}
+_LIST_BLOCK_START_ACTIONS = {'LOOP_START', 'FOREACH_LINE'}
+_LIST_BLOCK_END_ACTIONS = {'END_IF', 'END_LOOP', 'END_FOREACH'}
+
+
+def _is_list_block_start(action):
+    return action.startswith('IF_') or action in _LIST_BLOCK_START_ACTIONS
+
+
 class MacroApp:
     def __init__(self, root):
         self.root = root
+        self._setup_window()
+        self._setup_app_state()
+        self._setup_hotkeys()
+        self._setup_app_options()
+        self._setup_mouse_tracker()
+        self._setup_ocr_state()
+        self._setup_widget_factory()
+        self._show_loading_then_defer_ui()
+
+    def _setup_window(self):
         self.root.title(APP_TITLE)
-        self.root.geometry("1160x820")  # 稍微加宽以适应优化后的列宽 
-        
+        self.root.geometry("1160x820")  # 稍微加宽以适应优化后的列宽
+
         self.font_ui = ("Microsoft YaHei UI", 10)
         self.font_code = ("Consolas", 10)
-        
+
         self.root.style.configure(".", font=self.font_ui)
-        # <--- Treeview 样式配置
         self.root.style.configure("Treeview", font=self.font_code, rowheight=25)
         self.root.style.configure("Treeview.Heading", font=self.font_ui)
-        
+
         self.is_app_running = True
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
-        
-        # 设置窗口图标 (确保任务栏显示)
+
         icon_path = get_icon_path(APP_ICON, APP_VERSION)
         if icon_path and os.path.exists(icon_path):
             try:
@@ -142,25 +197,28 @@ class MacroApp:
                 print(f"[Info] AppUserModelID set: {APP_VERSION}")
                 self.root.iconbitmap(icon_path)
                 print(f"[Info] icon set: {icon_path}")
-            except Exception as e: 
+            except Exception as e:
                 print(f"[错误] 设置图标失败: {e}")
         else:
-            print(f"[警告] 未找到图标文件,使用默认图标")
-        
+            print("[警告] 未找到图标文件，使用默认图标")
+
+    def _setup_app_state(self):
         self.steps = []
         self.editing_index = None
         self.is_macro_running = False
-        self.last_test_location = None 
-        self.current_run_context = None 
+        self.last_test_location = None
+        self.current_run_context = None
         self.current_filepath = None
-        self._macro_thread = None          # [新增] 保存执行线程引用 by Antigravity
-        self._stop_in_progress = False   # 防重复停止标志
-        self._run_pending = False        # 延迟启动挂起标志
-        self._pending_run_id = None      # 延迟启动的 after ID
-        
-        # [新增] 迷你状态栏窗口
+        self._macro_thread = None
+        self._stop_in_progress = False
+        self._run_pending = False
+        self._pending_run_id = None
         self.mini_status_window = None
-        
+        self.recent_files = []
+        self.status_queue = queue.Queue()
+        self._last_mini_status = (None, None)
+
+    def _setup_hotkeys(self):
         self.hotkey_run_str = tb.StringVar(value=DEFAULT_HOTKEY_RUN)
         self.hotkey_stop_str = tb.StringVar(value=DEFAULT_HOTKEY_STOP)
         self.hotkey_manager = GlobalHotkeyManager(
@@ -170,22 +228,19 @@ class MacroApp:
             trigger_run_cb=self.safe_run_macro,
             trigger_stop_cb=self.safe_stop_macro
         )
-        
+
+    def _setup_app_options(self):
         self.current_theme = tb.StringVar(value=self.root.style.theme_use())
         self.skip_confirm_var = tb.BooleanVar(value=False)
         self.dont_minimize_var = tb.BooleanVar(value=False)
         self.enhanced_mode_var = tb.BooleanVar(value=False)
         self.run_enabled_var = tb.BooleanVar(value=False)
-        self.recent_files = []
-        self.status_queue = queue.Queue()
-        
-        # [变更] 使用 MouseTracker 类替代原有的 job 和 func
+
+    def _setup_mouse_tracker(self):
         self.mouse_pos_var = tb.StringVar()
         self.mouse_tracker = MouseTracker(self.root, self.mouse_pos_var)
-        
-        self._last_mini_status = (None, None)
-        
-        # OCR 引擎健康检查与映射
+
+    def _setup_ocr_state(self):
         self.FULL_OCR_NAME_MAP = {
             'auto': '自动选择 (Auto)',
             'winocr': 'Windows 10/11 OCR',
@@ -195,20 +250,18 @@ class MacroApp:
         }
         self.FULL_OCR_KEY_MAP = {name: key for key, name in self.FULL_OCR_NAME_MAP.items()}
         # OCR 引擎检测将在后台线程运行，先用占位值保证主线程快速进入 mainloop
-        self.available_ocr_engines = []   # 后台检测完成前的占位值
+        self.available_ocr_engines = []
         self.available_ocr_keys = ['auto']
-        
-        # [重构] 创建参数控件工厂实例（已迁移到 gui_utils.py）
+
+    def _setup_widget_factory(self):
         self.widget_factory = ParamWidgetFactory(
             font_ui=self.font_ui,
             font_code=self.font_code,
             ocr_name_map=self.FULL_OCR_NAME_MAP
         )
 
-        # ──────────────────────────────────────────────────────────────
-        # 显示 loading，将重型 UI 构建延迟到 mainloop 启动后执行。
-        # 窗口出现时已在事件循环中，不会触发「未响应」。
-        # ──────────────────────────────────────────────────────────────
+    def _show_loading_then_defer_ui(self):
+        # 窗口出现后再构建重型 UI，避免启动期看起来未响应。
         self.root.update_idletasks()
         self._splash_label = tk.Label(
             self.root,
@@ -220,13 +273,18 @@ class MacroApp:
         self._splash_label.place(relx=0.5, rely=0.5, anchor="center")
         self.root.update_idletasks()
         self.root.after(10, self._deferred_ui_init)
-
     def _deferred_ui_init(self):
         """mainloop 已启动后才执行 UI 构建，避免窗口冻结。"""
         if hasattr(self, '_splash_label') and self._splash_label:
             self._splash_label.destroy()
             self._splash_label = None
 
+        if not self._build_deferred_ui():
+            return
+
+        self._start_runtime_services()
+
+    def _build_deferred_ui(self):
         try:
             self._init_menu()
             self._init_ui()
@@ -235,20 +293,18 @@ class MacroApp:
             self.root.update()
             messagebox.showerror("初始化失败", f"UI 构建出错:\n{str(e)}")
             self.root.quit()
-            return
+            return False
+        return True
 
-        # 初始化悬浮预览管理器
+    def _start_runtime_services(self):
         self.tooltip_manager = ImageTooltipManager(self.steps_tree, lambda: self.steps)
-
         self.load_app_settings()
         self.update_recent_files_menu()
         self.update_status_bar_hotkeys()
         self.root.after(500, self.hotkey_manager.check_conflicts)
         self.hotkey_manager.start_listener()
-        # OCR 引擎异步检测
         threading.Thread(target=self._detect_ocr_engines_bg, daemon=True).start()
         self._check_status_queue()
-
     # ------------------------------------------------------------------
     # OCR 引擎异步检测（避免阻塞主线程）
     # ------------------------------------------------------------------
@@ -283,7 +339,12 @@ class MacroApp:
     def _init_menu(self):
         self.menu_bar = tk.Menu(self.root)
         self.root.config(menu=self.menu_bar)
-        
+        self._build_file_menu()
+        self._build_settings_menu()
+        self._build_theme_menu()
+        self._build_about_menu()
+
+    def _build_file_menu(self):
         file_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
         self.menu_bar.add_cascade(label="  文件  ", menu=file_menu)
         file_menu.add_command(label="📄 新建宏", accelerator="Ctrl+N", command=self.new_macro)
@@ -299,12 +360,14 @@ class MacroApp:
         self.root.bind('<Control-o>', lambda e: self.load_macro())
         self.root.bind('<Control-s>', lambda e: self.save_macro())
 
+    def _build_settings_menu(self):
         settings_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
         self.menu_bar.add_cascade(label="  设置  ", menu=settings_menu)
         settings_menu.add_command(label="⌨ 快捷键设置...", command=self.open_hotkey_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="🤖 AI 设置...", command=self.open_vlm_settings)
 
+    def _build_theme_menu(self):
         theme_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
         self.menu_bar.add_cascade(label="  主题  ", menu=theme_menu)
         
@@ -316,11 +379,20 @@ class MacroApp:
         for theme in dark_themes:
             theme_menu.add_radiobutton(label=f"暗 - {theme.capitalize()}", variable=self.current_theme, value=theme, command=self.change_theme)
 
+    def _build_about_menu(self):
         about_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
         self.menu_bar.add_cascade(label="  关于  ", menu=about_menu)
         about_menu.add_command(label="关于", command=self.show_about_dialog)
 
     def _init_ui(self):
+        self._build_status_bar()
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        self._build_step_list_panel(main_frame)
+        self._build_step_editor_panel(main_frame)
+        self.update_param_fields(None)
+
+    def _build_status_bar(self):
         status_bar_frame = ttk.Frame(self.root, bootstyle="primary")
         status_bar_frame.pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar()
@@ -330,55 +402,47 @@ class MacroApp:
         self.loop_status_label_right = ttk.Label(status_bar_frame, textvariable=self.loop_status_var, relief=tk.FLAT, anchor=tk.E, padding=(0, 5, 5, 5), bootstyle="primary-inverse", font=self.font_ui)
         self.loop_status_label_right.pack(side=tk.RIGHT)
 
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # =====================================================================
-        # 左侧面板 (Treeview + Preview)
-        # =====================================================================
+    def _build_step_list_panel(self, main_frame):
         list_frame = ttk.Frame(main_frame, padding=10)
         list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # 标题栏
+        self._build_steps_tree(list_frame)
+        self._build_step_list_controls(list_frame)
+
+    def _build_steps_tree(self, list_frame):
         title_frame = ttk.Frame(list_frame)
         title_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(title_frame, text="宏步骤序列:", font=("Microsoft YaHei UI", 11, "bold")).pack(side=tk.LEFT)
-        
-        # --- Treeview 替换 Listbox ---
+
         tree_frame = ttk.Frame(list_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         columns = ("id", "action", "params")
         self.steps_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
-        
+
         self.steps_tree.heading("id", text="#")
         self.steps_tree.heading("action", text="动作")
         self.steps_tree.heading("params", text="参数详情 / 备注")
-        
-        # 优化列宽：缩小序号列，适当缩小动作列，扩大参数列
+
         self.steps_tree.column("id", width=45, minwidth=40, stretch=False, anchor="center")
         self.steps_tree.column("action", width=220, minwidth=200, stretch=False)
         self.steps_tree.column("params", width=320, minwidth=280, stretch=True)
-        
+
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.steps_tree.yview)
         self.steps_tree.configure(yscrollcommand=scrollbar.set)
-        
+
         self.steps_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # 绑定事件
+
         self.steps_tree.bind("<Double-1>", lambda e: self.load_step_for_edit())
-        
-        # [新增] 右键菜单
+
         self.tree_menu = tk.Menu(self.root, tearoff=0, font=self.font_ui)
         self.tree_menu.add_command(label="屏蔽/启用选中步骤", command=self.toggle_step_enabled)
         self.steps_tree.bind("<Button-3>", self.show_tree_menu)
-        
-        # 配置编辑行的样式
+
         self.steps_tree.tag_configure('editing', background='#FFF3CD')
         self.steps_tree.tag_configure('disabled', foreground='#999999')
-        # 备注行使用与其他行相同的样式
 
+    def _build_step_list_controls(self, list_frame):
         left_bottom_frame = ttk.Frame(list_frame)
         left_bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10,0))
         left_bottom_frame.columnconfigure(0, weight=1); left_bottom_frame.columnconfigure(1, weight=1)
@@ -394,53 +458,210 @@ class MacroApp:
         self.load_step_btn.grid(row=0, column=3, sticky="nsew", padx=(2, 0), pady=(0, 5))
 
         self.run_btn = ttk.Button(left_bottom_frame, text="", command=self.run_macro, bootstyle="success", padding=(15, 10))
-        self.run_btn.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=(0, 0), pady=5) 
-        
+        self.run_btn.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=(0, 0), pady=5)
+
         check_frame = ttk.Frame(left_bottom_frame)
         check_frame.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
         check_frame.columnconfigure(0, weight=1); check_frame.columnconfigure(1, weight=1)
-        
+
         skip_check = ttk.Checkbutton(check_frame, text="跳过运行前的确认提示", variable=self.skip_confirm_var, bootstyle="primary-round-toggle")
-        skip_check.grid(row=0, column=0, sticky="w", padx=2, pady=(0, 5)) 
+        skip_check.grid(row=0, column=0, sticky="w", padx=2, pady=(0, 5))
         minimize_check = ttk.Checkbutton(check_frame, text="运行时主界面不最小化", variable=self.dont_minimize_var, bootstyle="primary-round-toggle")
         minimize_check.grid(row=0, column=1, sticky="w", padx=2, pady=(0, 5))
-        
+
         enhanced_check = ttk.Checkbutton(check_frame, text="开启增强模式 (识别不到小字时可开启)", variable=self.enhanced_mode_var, bootstyle="success-round-toggle")
         enhanced_check.grid(row=1, column=0, sticky="w", padx=2, pady=(0, 5))
-        
+
         run_enabled_check = ttk.Checkbutton(check_frame, text="启用 RUN 步骤 (注意安全风险)", variable=self.run_enabled_var, bootstyle="danger-round-toggle")
         run_enabled_check.grid(row=1, column=1, sticky="w", padx=2, pady=(0, 5))
-        
-        # =====================================================================
-        # 右侧面板
-        # =====================================================================
+
+    def _build_step_editor_panel(self, main_frame):
         add_frame = ttk.Labelframe(main_frame, text="添加新步骤", padding=10)
         add_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10, expand=False)
-        
-        add_frame.pack_propagate(False)  # 禁止子控件影响父容器
-        add_frame.configure(width=380)   # 固定宽度
-        
+
+        add_frame.pack_propagate(False)
+        add_frame.configure(width=380)
+
         right_bottom_frame = ttk.Frame(add_frame)
         right_bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10,0))
-        right_bottom_frame.columnconfigure(0, weight=2); right_bottom_frame.columnconfigure(1, weight=1) 
-        
+        right_bottom_frame.columnconfigure(0, weight=2); right_bottom_frame.columnconfigure(1, weight=1)
+
         self.add_step_btn = ttk.Button(right_bottom_frame, text="＋ 添加到序列 >>", command=self.add_or_update_step, bootstyle="success", padding=(12, 8))
         self.add_step_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 2), columnspan=2)
         self.cancel_edit_btn = ttk.Button(right_bottom_frame, text="✕ 取消修改", command=self.cancel_edit_mode, bootstyle="secondary", padding=(10, 6))
-        
+
         ttk.Label(add_frame, text="选择动作:").pack(anchor="w")
-        self.action_type = ttk.Combobox(add_frame, state="readonly", font=self.font_ui, height=16) 
+        self.action_type = ttk.Combobox(add_frame, state="readonly", font=self.font_ui, height=16)
         self.action_type['values'] = list(MacroSchema.ACTION_TRANSLATIONS.values())
         self.action_type.current(0)
-        
+
         self.action_type.pack(anchor="w", fill=tk.X, pady=5)
         self.action_type.bind("<<ComboboxSelected>>", self.update_param_fields)
-        self.param_frame = ttk.Frame(add_frame)
-        self.param_frame.pack(fill=tk.X, expand=True, pady=5)
-        
-        # [变更] 不再需要绑定 Configure 事件，AutoWrapLabel 会自动处理
+
+        param_area = ttk.Frame(add_frame)
+        param_area.pack(fill=tk.BOTH, expand=True, pady=5)
+        self._build_scrollable_param_area(param_area)
+
         self.param_widgets = {}
-        self.update_param_fields(None)
+
+    def _build_scrollable_param_area(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        self.param_canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0)
+        self.param_scrollbar = tk.Canvas(self.param_canvas, width=8, highlightthickness=0, borderwidth=0)
+        self.param_frame = ttk.Frame(self.param_canvas)
+        self.param_window = self.param_canvas.create_window((0, 0), window=self.param_frame, anchor="nw")
+        self._param_scrollbar_visible = False
+        self._param_scrollbar_update_pending = False
+        self._param_scroll_drag_offset = 0
+        self._param_scroll_thumb = (0, 0)
+
+        self.param_canvas.configure(yscrollcommand=self._on_param_yview_changed)
+        self.param_canvas.grid(row=0, column=0, sticky="nsew")
+        self._style_floating_param_scrollbar()
+
+        self.param_frame.bind("<Configure>", self._on_param_frame_configure)
+        self.param_canvas.bind("<Configure>", self._on_param_canvas_configure)
+        self.param_scrollbar.bind("<ButtonPress-1>", self._on_param_scrollbar_press)
+        self.param_scrollbar.bind("<B1-Motion>", self._on_param_scrollbar_drag)
+        self._bind_param_mousewheel()
+        self._update_param_scrollbar_visibility()
+
+    def _style_floating_param_scrollbar(self):
+        try:
+            bg = self.param_canvas.cget("background")
+        except Exception:
+            bg = "#f5f5f5"
+        self.param_scrollbar.configure(background=bg)
+        self._param_scroll_thumb_color = "#9aa0a6"
+        self._param_scroll_thumb_active_color = "#6f767d"
+
+    def _on_param_frame_configure(self, event=None):
+        if hasattr(self, 'param_canvas'):
+            self.param_canvas.configure(scrollregion=self.param_canvas.bbox("all"))
+            self._schedule_param_scrollbar_update()
+
+    def _on_param_canvas_configure(self, event):
+        if hasattr(self, 'param_window'):
+            self.param_canvas.itemconfigure(self.param_window, width=event.width)
+            self._schedule_param_scrollbar_update()
+
+    def _on_param_yview_changed(self, first, last):
+        self._schedule_param_scrollbar_update()
+
+    def _schedule_param_scrollbar_update(self):
+        if getattr(self, '_param_scrollbar_update_pending', False):
+            return
+        self._param_scrollbar_update_pending = True
+        self.root.after_idle(self._update_param_scrollbar_visibility)
+
+    def _update_param_scrollbar_visibility(self):
+        if not hasattr(self, 'param_canvas'):
+            return
+        self._param_scrollbar_update_pending = False
+        bbox = self.param_canvas.bbox("all")
+        content_height = (bbox[3] - bbox[1]) if bbox else 0
+        canvas_height = max(self.param_canvas.winfo_height(), 1)
+        should_show = content_height > canvas_height + 1
+        self._set_param_scrollbar_visible(should_show)
+        if not should_show:
+            self.param_canvas.yview_moveto(0)
+        self._draw_param_scrollbar_thumb()
+
+    def _set_param_scrollbar_visible(self, visible):
+        if getattr(self, '_param_scrollbar_visible', False) == visible:
+            return
+        self._param_scrollbar_visible = visible
+        if visible:
+            self.param_scrollbar.place(in_=self.param_canvas, relx=1.0, rely=0.0, relheight=1.0, anchor="ne", width=8)
+        else:
+            self.param_scrollbar.place_forget()
+
+    def _draw_param_scrollbar_thumb(self, active=False):
+        if not getattr(self, '_param_scrollbar_visible', False):
+            self.param_scrollbar.delete("all")
+            return
+        self.param_scrollbar.update_idletasks()
+        height = max(self.param_scrollbar.winfo_height(), self.param_canvas.winfo_height(), 1)
+        first, last = self.param_canvas.yview()
+        visible_fraction = max(last - first, 0.05)
+        thumb_height = max(int(height * visible_fraction), 24)
+        thumb_height = min(thumb_height, height)
+        track_height = max(height - thumb_height, 1)
+        y1 = int(track_height * first / max(1.0 - visible_fraction, 0.0001)) if visible_fraction < 1 else 0
+        y1 = max(0, min(y1, height - thumb_height))
+        y2 = y1 + thumb_height
+        self._param_scroll_thumb = (y1, y2)
+        color = self._param_scroll_thumb_active_color if active else self._param_scroll_thumb_color
+        self.param_scrollbar.delete("all")
+        self.param_scrollbar.create_rectangle(2, y1, 6, y2, fill=color, outline="")
+
+    def _on_param_scrollbar_press(self, event):
+        if not getattr(self, '_param_scrollbar_visible', False):
+            return "break"
+        y1, y2 = self._param_scroll_thumb
+        if y1 <= event.y <= y2:
+            self._param_scroll_drag_offset = event.y - y1
+        else:
+            self._param_scroll_drag_offset = max((y2 - y1) // 2, 0)
+            self._move_param_scrollbar_thumb_to(event.y)
+        self._draw_param_scrollbar_thumb(active=True)
+        return "break"
+
+    def _on_param_scrollbar_drag(self, event):
+        if not getattr(self, '_param_scrollbar_visible', False):
+            return "break"
+        self._move_param_scrollbar_thumb_to(event.y)
+        self._draw_param_scrollbar_thumb(active=True)
+        return "break"
+
+    def _move_param_scrollbar_thumb_to(self, y):
+        height = max(self.param_scrollbar.winfo_height(), 1)
+        y1, y2 = self._param_scroll_thumb
+        thumb_height = max(y2 - y1, 1)
+        track_height = max(height - thumb_height, 1)
+        target = max(0, min(y - self._param_scroll_drag_offset, track_height))
+        self.param_canvas.yview_moveto(target / track_height)
+
+    def _bind_param_mousewheel(self):
+        self._bind_param_mousewheel_target(self.param_canvas)
+        self._bind_param_mousewheel_target(self.param_frame)
+
+    def _bind_param_mousewheel_target(self, widget):
+        if getattr(widget, '_macromate_param_scroll_bound', False):
+            return
+        widget.bind("<MouseWheel>", self._on_param_mousewheel, add="+")
+        widget.bind("<Button-4>", self._on_param_mousewheel, add="+")
+        widget.bind("<Button-5>", self._on_param_mousewheel, add="+")
+        widget._macromate_param_scroll_bound = True
+
+    def _bind_param_mousewheel_to_children(self, widget=None):
+        widget = widget or self.param_frame
+        self._bind_param_mousewheel_target(widget)
+        for child in widget.winfo_children():
+            self._bind_param_mousewheel_to_children(child)
+
+    def _on_param_mousewheel(self, event):
+        if not hasattr(self, 'param_canvas'):
+            return None
+        if getattr(event, 'num', None) == 4:
+            direction = -1
+        elif getattr(event, 'num', None) == 5:
+            direction = 1
+        else:
+            direction = -1 if event.delta > 0 else 1
+        self.param_canvas.yview_scroll(direction, "units")
+        return "break"
+
+    def _refresh_param_scroll_region(self):
+        if not hasattr(self, 'param_canvas'):
+            return
+        self.root.update_idletasks()
+        self._bind_param_mousewheel_to_children()
+        self.param_canvas.configure(scrollregion=self.param_canvas.bbox("all"))
+        self.param_canvas.yview_moveto(0)
+        self._update_param_scrollbar_visibility()
 
     # --- Treeview 辅助方法 ---
     def _get_selected_index(self):
@@ -449,20 +670,33 @@ class MacroApp:
         if not selected_items: return None
         return self.steps_tree.index(selected_items[0])
 
-    def update_status_bar_hotkeys(self):
-        """更新状态栏和运行按钮上的快捷键提示"""
+    def _get_hotkey_display_pair(self):
         run_display = capitalize_hotkey_str(self.hotkey_run_str.get())
         stop_display = capitalize_hotkey_str(self.hotkey_stop_str.get())
-        self.status_var.set(f"准备就绪...  |  [{run_display}] 启动宏  |  [{stop_display}] 停止宏")
-        self.run_btn.config(text=f"▶ 运行宏 ({run_display})")
+        return run_display, stop_display
+
+    def _format_status_bar_text(self, run_display, stop_display):
+        return f"准备就绪...  |  [{run_display}] 启动宏  |  [{stop_display}] 停止宏"
+
+    def _format_run_button_text(self, run_display):
+        return f"▶ 运行宏 ({run_display})"
+
+    def update_status_bar_hotkeys(self):
+        """更新状态栏和运行按钮上的快捷键提示"""
+        run_display, stop_display = self._get_hotkey_display_pair()
+        self.status_var.set(self._format_status_bar_text(run_display, stop_display))
+        self.run_btn.config(text=self._format_run_button_text(run_display))
+
+    def _format_window_title(self):
+        if not self.current_filepath:
+            return APP_TITLE
+
+        filename = os.path.basename(self.current_filepath)
+        return f"{APP_TITLE}  ---  {filename}"
 
     def update_title(self):
         """更新窗口标题栏，额外加上当前宏文件的文件名"""
-        if self.current_filepath:
-            filename = os.path.basename(self.current_filepath)
-            self.root.title(f"{APP_TITLE}  ---  {filename}")
-        else:
-            self.root.title(APP_TITLE)
+        self.root.title(self._format_window_title())
 
     def open_hotkey_settings(self):
         """打开快捷键设置对话框"""
@@ -581,6 +815,8 @@ class MacroApp:
             self.update_param_fields(None)
             return
 
+        self._refresh_param_scroll_region()
+
 
     # update_loop_params 和 update_run_params 已迁移到 gui_utils.py
 
@@ -620,7 +856,8 @@ class MacroApp:
             self.root.iconify()
             # 将 region_box 传给线程
             self._run_test_after_iconify(self._test_find_image, (path, conf, region_box))
-        except: messagebox.showerror("错误", "参数无效")
+        except Exception as e:
+            messagebox.showerror('错误', f"参数无效: {e}")
 
     def on_test_find_text_click(self):
         try:
@@ -650,7 +887,8 @@ class MacroApp:
             self.root.iconify()
             # 将 region_box 传给线程
             self._run_test_after_iconify(self._test_find_text, (text, lang, engine, region_box))
-        except: messagebox.showerror("错误", "参数无效")
+        except Exception as e:
+            messagebox.showerror('错误', f"参数无效: {e}")
 
     def on_test_ai_command_click(self):
         """测试 AI 自然语言指令"""
@@ -668,7 +906,8 @@ class MacroApp:
             self.status_var.set("AI 分析中...")
             self.root.iconify()
             self._run_test_after_iconify(self._test_ai_command, (instruction, region_box))
-        except: messagebox.showerror("错误", "参数无效")
+        except Exception as e:
+            messagebox.showerror('错误', f"参数无效: {e}")
 
     def _run_test_after_iconify(self, func, args, attempts=0):
         if self.root.state() == 'iconic' or attempts >= 15:
@@ -855,12 +1094,7 @@ class MacroApp:
             saved_mode = step['params'].get('mode', 'fixed')
             
             # 翻译模式为中文
-            mode_map_rev = {
-                'fixed': '固定次数',
-                'until_image': '直到找到图像',
-                'until_text': '直到找到文本'
-            }
-            display_mode = mode_map_rev.get(saved_mode, '固定次数')
+            display_mode = gui_utils.LOOP_MODE_DISPLAY_BY_VALUE.get(saved_mode, '固定次数')
             
             # 1. 强行修改下拉框的值
             if 'mode' in self.param_widgets:
@@ -878,12 +1112,7 @@ class MacroApp:
             saved_run_type = step['params'].get('run_type', 'command')
             
             # 翻译类型为中文
-            run_type_map_rev = {
-                'command': 'command (命令)',
-                'script': 'script (脚本)',
-                'file': 'file (写入文件)'
-            }
-            display_run_type = run_type_map_rev.get(saved_run_type, 'command (命令)')
+            display_run_type = MacroSchema.RUN_TYPE_DISPLAY_BY_VALUE.get(saved_run_type, 'command (命令)')
             
             # 1. 强行修改下拉框的值
             if 'run_type' in self.param_widgets:
@@ -946,156 +1175,133 @@ class MacroApp:
         self.add_step_btn.grid_configure(columnspan=2)
         self.update_listbox_display()
 
+    def _format_step_params(self, step, act):
+        # 参数预览文本
+        display_params = step['params'].copy()
+        
+        cache_str = ""
+        if 'region' in display_params or 'cache_box' in display_params:
+            box = display_params.pop('region', display_params.pop('cache_box', None))
+            if isinstance(box, (list, tuple)) and len(box) >= 4:
+                cache_str = f"[区域: {box[0]},{box[1]},{box[2]},{box[3]}] "
+            elif box is not None:
+                cache_str = "[区域: 无效] "
+
+        if 'engine' in display_params:
+            # <--- 列表显示时也使用完整映射
+            display_params['engine'] = self.FULL_OCR_NAME_MAP.get(display_params['engine'], display_params['engine'])
+            
+        # 格式化参数列字符串
+        param_text = f"{cache_str}{display_params}" if display_params else ""
+        
+        # 备注动作特殊处理：显示为注释格式
+        if act == 'NOTE':
+            note_text = step['params'].get('text', '')
+            param_text = f"// {note_text}" if note_text else "// (空备注)"
+
+        formatter = _STEP_PARAM_PREVIEW_FORMATTERS.get(act)
+        if formatter:
+            param_text = formatter(step['params'])
+        
+        # 插入行 (Values对应: id, action, params)
+        return param_text
+
+    def _get_step_display_indent(self, action, block_stack):
+        return max(0, len(block_stack) - (1 if action in _LIST_DEDENT_ACTIONS else 0))
+
+    def _update_display_block_stack(self, action, block_stack):
+        if _is_list_block_start(action):
+            block_stack.append(action)
+        elif action in _LIST_BLOCK_END_ACTIONS and block_stack:
+            block_stack.pop()
+
+    def _get_step_tree_tags(self, index, is_enabled):
+        tags = []
+        if index == self.editing_index:
+            tags.append('editing')
+        if not is_enabled:
+            tags.append('disabled')
+        return tuple(tags)
+
+    def _build_step_tree_row(self, index, step, block_stack):
+        act = step['action']
+        indent_str = "    " * self._get_step_display_indent(act, block_stack)
+        param_text = self._format_step_params(step, act)
+        action_label = MacroSchema.ACTION_TRANSLATIONS.get(act, act)
+        is_enabled = step.get('enabled', True)
+
+        display_action = f"{indent_str}{action_label}"
+        if not is_enabled:
+            display_action = f"{indent_str}[屏蔽] {action_label}"
+
+        values = (index + 1, display_action, param_text)
+        tags = self._get_step_tree_tags(index, is_enabled)
+        return act, values, tags
+
+    def _focus_step_tree_item_if_editing(self, index, item_id):
+        if index == self.editing_index:
+            self.steps_tree.see(item_id)
+            self.steps_tree.selection_set(item_id)
+
+    def _is_step_toggle_allowed(self, index):
+        action = self.steps[index].get('action', '')
+        return action not in MacroSchema.CONTROL_FLOW_ACTIONS
+
+    def _set_tree_menu_toggle_state(self, index):
+        state = "normal" if self._is_step_toggle_allowed(index) else "disabled"
+        self.tree_menu.entryconfig(0, state=state)
+
+    def _get_context_menu_step_index(self, event):
+        item = self.steps_tree.identify_row(event.y)
+        if not item:
+            return None
+
+        self.steps_tree.selection_set(item)
+        return self._get_selected_index()
+
+    def _warn_control_flow_toggle_blocked(self):
+        messagebox.showwarning("提示", "不可屏蔽流程控制节点（条件、循环），以防止引发严重 BUG。", parent=self.root)
+
+    def _toggle_step_enabled_at(self, index):
+        step = self.steps[index]
+        step['enabled'] = not step.get('enabled', True)
+
     def update_listbox_display(self):
-        """更新 Treeview 显示"""
+        """Refresh the Treeview display."""
         for item in self.steps_tree.get_children():
             self.steps_tree.delete(item)
-            
+
         block_stack = []
         for i, step in enumerate(self.steps):
-            act = step['action']
-            
-            # 缩进逻辑
-            current_indent_level = max(0, len(block_stack) - (1 if act in ['ELSE', 'END_IF', 'END_LOOP', 'END_FOREACH'] else 0))
-            indent_str = "    " * current_indent_level
-            
-            # 参数预览文本
-            display_params = step['params'].copy()
-            
-            cache_str = ""
-            if 'region' in display_params or 'cache_box' in display_params:
-                box = display_params.pop('region', display_params.pop('cache_box', None))
-                if isinstance(box, (list, tuple)) and len(box) >= 4:
-                    cache_str = f"[区域: {box[0]},{box[1]},{box[2]},{box[3]}] "
-                elif box is not None:
-                    cache_str = f"[区域: 无效] "
-
-            if 'engine' in display_params:
-                # <--- 列表显示时也使用完整映射
-                display_params['engine'] = self.FULL_OCR_NAME_MAP.get(display_params['engine'], display_params['engine'])
-                
-            # 格式化参数列字符串
-            param_text = f"{cache_str}{display_params}" if display_params else ""
-            
-            action_label = MacroSchema.ACTION_TRANSLATIONS.get(act, act)
-            
-            # 备注动作特殊处理：显示为注释格式
-            if act == 'NOTE':
-                note_text = step['params'].get('text', '')
-                param_text = f"// {note_text}" if note_text else "// (空备注)"
-
-            if act == 'GOTO_LABEL':
-                label = step['params'].get('label', '')
-                max_jumps = step['params'].get('max_jumps', 100)
-                param_text = f"-> {label}  [最多 {max_jumps} 次]"
-            elif act == 'SET_VAR':
-                name = step['params'].get('var_name', '')
-                val = step['params'].get('var_value', '')
-                param_text = f"变量 {name} = '{val}'"
-            elif act == 'READ_FILE':
-                path = step['params'].get('file_path', '')
-                name = step['params'].get('var_name', '')
-                param_text = f"读取 '{path}' -> 变量 {name}"
-            elif act == 'EXTRACT_VAR':
-                src = step['params'].get('source_text', '')
-                name = step['params'].get('var_name', '')
-                reg = step['params'].get('regex', '')
-                param_text = f"'{src}' 提取 '{reg}' -> 变量 {name}"
-            elif act == 'JSON_EXTRACT':
-                path = step['params'].get('json_path', '')
-                name = step['params'].get('var_name', '')
-                has_default = step['params'].get('use_default') or str(step['params'].get('default_value', '')) != ''
-                fallback_text = "；失败用默认值" if has_default else ""
-                param_text = f"JSON 路径 '{path or '$'}' -> 变量 {name}{fallback_text}"
-            elif act == 'PROMPT_INPUT':
-                prompt = step['params'].get('prompt', '')
-                name = step['params'].get('var_name', '')
-                param_text = f"人工输入 '{prompt}' -> 变量 {name}"
-            elif act == 'FOREACH_LINE':
-                source = step['params'].get('file_path') or step['params'].get('source_text', '')
-                line_var = step['params'].get('current_line_var', 'current_line')
-                fields = step['params'].get('field_names', '')
-                suffix = f"；拆分为 {fields}" if fields else ""
-                param_text = f"批量处理 '{source}' -> {{{line_var}}}{suffix}"
-            elif act == 'END_FOREACH':
-                param_text = "结束批量处理"
-            elif act == 'IF_VAR':
-                val = step['params'].get('var_value', '')
-                op = step['params'].get('operator', '==')
-                exp = step['params'].get('expected_val', '')
-                param_text = f"如果 '{val}' {op} '{exp}'"
-            elif act == 'CALCULATE':
-                expr = step['params'].get('expression', '')
-                name = step['params'].get('var_name', '')
-                param_text = f"变量计算 '{expr}' -> 变量 {name}"
-            elif act == 'WRITE_FILE':
-                path = step['params'].get('file_path', '')
-                param_text = f"写入至 '{path}'"
-            elif act == 'GOTO_IF':
-                val = step['params'].get('var_value', '')
-                op = step['params'].get('operator', '==')
-                exp = step['params'].get('expected_val', '')
-                label = step['params'].get('label', '')
-                param_text = f"如果 '{val}' {op} '{exp}' -> 跳转至 {label}"
-            
-            # 插入行 (Values对应: id, action, params)
-            is_enabled = step.get('enabled', True)
-            display_action = f"{indent_str}{action_label}"
-            if not is_enabled:
-                display_action = f"{indent_str}[屏蔽] {action_label}"
-                
-            item_id = self.steps_tree.insert("", "end", values=(
-                i + 1,
-                display_action,
-                param_text
-            ))
-            
-            tags = []
-            if i == self.editing_index:
-                tags.append('editing')
-            if not is_enabled:
-                tags.append('disabled')
-                
+            act, values, tags = self._build_step_tree_row(i, step, block_stack)
+            item_id = self.steps_tree.insert("", "end", values=values)
             if tags:
-                self.steps_tree.item(item_id, tags=tuple(tags))
-                
-            if i == self.editing_index:
-                # 确保滚动可见
-                self.steps_tree.see(item_id)
-                # 保持选中状态 (可选)
-                self.steps_tree.selection_set(item_id)
+                self.steps_tree.item(item_id, tags=tags)
 
-            if act.startswith('IF_') or act in ('LOOP_START', 'FOREACH_LINE'):
-                block_stack.append(act)
-            elif act in ['END_IF', 'END_LOOP', 'END_FOREACH'] and block_stack:
-                block_stack.pop()
+            self._focus_step_tree_item_if_editing(i, item_id)
+            self._update_display_block_stack(act, block_stack)
 
     def show_tree_menu(self, event):
-        """显示树形列表右键菜单"""
-        item = self.steps_tree.identify_row(event.y)
-        if item:
-            self.steps_tree.selection_set(item)
-            idx = self._get_selected_index()
-            if idx is not None:
-                act = self.steps[idx].get('action', '')
-                if act in MacroSchema.CONTROL_FLOW_ACTIONS:
-                    self.tree_menu.entryconfig("屏蔽/启用选中步骤", state="disabled")
-                else:
-                    self.tree_menu.entryconfig("屏蔽/启用选中步骤", state="normal")
-            self.tree_menu.post(event.x_root, event.y_root)
+        """Show the step list context menu."""
+        idx = self._get_context_menu_step_index(event)
+        if idx is None:
+            return
+
+        self._set_tree_menu_toggle_state(idx)
+        self.tree_menu.post(event.x_root, event.y_root)
 
     def toggle_step_enabled(self):
         """切换选中步骤的启用/屏蔽状态"""
         idx = self._get_selected_index()
-        if idx is not None:
-            step = self.steps[idx]
-            act = step.get('action', '')
-            if act in MacroSchema.CONTROL_FLOW_ACTIONS:
-                messagebox.showwarning("提示", "不可屏蔽流程控制节点（条件、循环），以防止引发严重 BUG。", parent=self.root)
-                return
-            
-            step['enabled'] = not step.get('enabled', True)
-            self.update_listbox_display()
+        if idx is None:
+            return
+
+        if not self._is_step_toggle_allowed(idx):
+            self._warn_control_flow_toggle_blocked()
+            return
+
+        self._toggle_step_enabled_at(idx)
+        self.update_listbox_display()
 
     def remove_step(self):
         # --- 升级: 适配 Treeview ---
@@ -1146,7 +1352,7 @@ class MacroApp:
         # [修复BUG-5] 步骤为空时给出明确提示，而非静默无响应
         if not self.is_macro_running and not self._run_pending and self.editing_index is None:
             if not self.steps:
-                self.root.after(0, lambda: self.status_var.set("提示: 宏为空，请先添加步骤再运行"))
+                self.root.after(0, self.status_var.set, '提示: 宏为空，请先添加步骤再运行')
                 return
             self.root.after(0, self.run_macro, True)
         
@@ -1159,13 +1365,13 @@ class MacroApp:
             if self._pending_run_id is not None:
                 self.root.after_cancel(self._pending_run_id)
                 self._pending_run_id = None
-            self.status_var.set("\u5df2\u53d6\u6d88\u5f85\u6267\u884c\u7684\u5b8f")
+            self.status_var.set("已取消待执行的宏")
             self._restore_macro_idle_ui()
             return
         if not self.is_macro_running:
             return
         self._stop_in_progress = True
-        self.root.after(0, self.status_var.set, "\u6b63\u5728\u505c\u6b62...")
+        self.root.after(0, self.status_var.set, "正在停止...")
         if self.current_run_context:
             self.current_run_context['stop_requested'] = True
             macro_engine.cleanup_active_processes(self.current_run_context)
@@ -1180,7 +1386,7 @@ class MacroApp:
             return
         tid = t.ident
         if not tid:
-            print("\u4e2d\u65ad: thread ID invalid; exception not injected")
+            print("中断: thread ID invalid; exception not injected")
             return
         if not (self.current_run_context or {}).get('allow_force_thread_stop', False):
             print("Stop: cooperative stop timed out; force thread injection is disabled")
@@ -1441,8 +1647,9 @@ class MacroApp:
     def load_app_settings(self):
         """加载应用设置"""
         try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config_path = CONFIG_FILE
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
                     d = json.load(f)
                     self.recent_files = d.get('recent_files', [])
                     self.current_theme.set(d.get('theme', 'litera'))
@@ -1460,9 +1667,10 @@ class MacroApp:
         """保存应用设置"""
         try:
             settings = {}
-            if os.path.exists(CONFIG_FILE):
+            read_path = CONFIG_FILE
+            if os.path.exists(read_path):
                 try:
-                    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    with open(read_path, 'r', encoding='utf-8') as f:
                         settings = json.load(f)
                     if not isinstance(settings, dict):
                         settings = {}
@@ -1478,6 +1686,7 @@ class MacroApp:
                 'skip_confirm': self.skip_confirm_var.get(),
                 'dont_minimize': self.dont_minimize_var.get()
             })
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             tmp_path = CONFIG_FILE + '.tmp'
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
@@ -1519,7 +1728,7 @@ if __name__ == "__main__":
         try:
             # 加载脚本
             print("[CLI] Loading script...")
-            with open(script_file, 'r', encoding='utf-8') as f:
+            with open(script_file, 'r', encoding='utf-8-sig') as f:
                 script_data = json.load(f)
             
             # 支持两种格式:
@@ -1577,6 +1786,3 @@ if __name__ == "__main__":
         main_window = tb.Window(themename=theme)
         app = MacroApp(main_window)
         main_window.mainloop()
-
-
-

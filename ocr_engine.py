@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 # ocr_engine.py
 # 描述:自动化宏的 OCR 功能引擎
-# 版本:1.7.1
-# 变更:(终极修复) 返回完整识别文本,支持剪贴板功能
+# 版本:1.8.1
 
 from PIL import Image, ImageGrab
 import re
 import os
 import subprocess
-import io
 import time
 import sys
 import threading
@@ -480,5 +478,5 @@ def get_available_engines():
         
     return engines
 
-ocr_engine_version = "1.7.1"
+ocr_engine_version = "1.8.1"
 
